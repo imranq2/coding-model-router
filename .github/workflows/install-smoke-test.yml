@@ -53,3 +53,8 @@ jobs:
         run: |
           test -x ~/model-router/venv/bin/python
           ~/model-router/venv/bin/python -c "import fastapi, uvicorn, httpx; print('OK: packages present')"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          bash ~/model-router/uninstall-model-router.sh 2>/dev/null || rm -rf ~/model-router
