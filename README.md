@@ -4,59 +4,91 @@ Local GPU-accelerated model routing for Claude Code on Apple Silicon Macs (M1/M2
 
 ## Prerequisites
 
-This project only works on Apple Silicon Macs (M1, M2, M3, or M4) with macOS.
+> **macOS only.** This project uses vllm-mlx for Apple Silicon GPU inference and will not run on Linux, Windows, or Intel Macs.
 
-### Required Software
+### Supported Hardware
 
-- **Python 3.10-3.13** — The installer prefers Python 3.12, but will use any supported version (3.10, 3.11, 3.12, or 3.13)
-- **Homebrew** (recommended) — For installing Python if not already available: `brew install python@3.12`
-- **AWS CLI** (optional) — Only needed if using AWS Bedrock as a backend: `brew install awscli`
+- **Mac**: Apple Silicon — M1, M2, M3, or M4 (any variant: Pro, Max, Ultra)
+- **RAM**: 16GB minimum; 24GB+ recommended for larger models (the model must fit in unified memory)
+- **Storage**: 15–30GB free space for model downloads (varies by model)
 
-### Hardware
+### macOS Version
 
-- **RAM**: At least 16GB required, 24GB+ recommended for larger models
-- **GPU**: Apple Silicon GPU (integrated in M1/M2/M3/M4)
-- **Storage**: ~15-30GB free space for model downloads (depending on selected model)
+- **macOS 12 Monterey or later** — required for Metal GPU acceleration used by vllm-mlx
+
+### Required macOS Setup
+
+1. **Xcode Command Line Tools** — needed to compile native Python packages:
+   ```bash
+   xcode-select --install
+   ```
+   If already installed you'll see `"xcode-select: error: command line tools are already installed"` — that's fine.
+
+2. **Homebrew** — recommended package manager for macOS:
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+
+3. **Python 3.10–3.13** — the installer prefers Python 3.12:
+   ```bash
+   brew install python@3.12
+   ```
+
+4. **AWS CLI** *(optional)* — only needed if routing Sonnet through AWS Bedrock:
+   ```bash
+   brew install awscli
+   aws configure   # enter your AWS credentials
+   ```
 
 ### Network
 
 - Initial install requires internet access to download Python packages and models
-- Once installed, local models work offline; cloud backends (Anthropic/Bedrock) still require internet
-
-## What This Code Does
+- Once installed, local models work fully offline; cloud backends (Anthropic/Bedrock) still require internet
 
 ## What This Code Does
 
 This project provides a routing proxy that lets Claude Code use local GPU models for background/cheap tasks while keeping complex reasoning on cloud APIs (Anthropic or AWS Bedrock).
 
-### How It Works
+### `claude` vs `claude-router`
+
+Routing is **strictly opt-in**. The normal `claude` command is completely unaffected — it bypasses the proxy entirely and talks to Anthropic directly, exactly as it did before installation.
+
+```
+  claude (unchanged)              claude-router (opt-in)
+  ──────────────────              ──────────────────────
+  No env vars changed             Sets for this invocation only:
+                                    ANTHROPIC_BASE_URL=http://localhost:8771
+
+         │                                    │
+         ▼                                    ▼
+  ┌─────────────┐                  ┌─────────────────────┐
+  │ Anthropic   │                  │ router.py (:8771)   │
+  │ API         │                  │ proxy               │
+  │ (direct)    │                  └──────────┬──────────┘
+  └─────────────┘                             │
+                               ┌──────────────┼──────────────┐
+                               ▼              ▼              ▼
+                          ┌────────┐   ┌──────────┐   ┌──────────┐
+                          │ vllm-  │   │  Bedrock │   │Anthropic │
+                          │ mlx    │   │  Mantle  │   │  API     │
+                          │ (:8770)│   │          │   │          │
+                          └────────┘   └──────────┘   └──────────┘
+                          Haiku→local  Sonnet→AWS    Opus/Fable→cloud
+```
+
+`claude-router` sets `ANTHROPIC_BASE_URL` only for its own shell function invocation — it does not persist, does not affect other terminals, and does not modify any global config. As soon as that session ends, the env var is gone.
+
+### How the Router Works
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  claude-router (shell function)                                     │
-│  Sets env vars for ONE invocation only                              │
-│    • ANTHROPIC_BASE_URL=http://localhost:8771                       │
-│    • ANTHROPIC_MODEL=opusplan (Opus for planning, Sonnet for exec)  │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
 │  router.py (:8771) - FastAPI proxy                                  │
 │  Routes by 'model' field in request body:                           │
-│    • claude-haiku-4-5-20251001 → vllm-mlx (:8770) [local GPU]       │
-│    • claude-sonnet-4-6         → Bedrock Mantle [AWS]              │
+│    • claude-haiku-4-5-20251001 → vllm-mlx (:8770) [local GPU]      │
+│    • claude-sonnet-4-6         → Bedrock Mantle [AWS]               │
 │    • claude-opus-4-8           → Anthropic API [cloud]              │
 │    • claude-fable-5            → Anthropic API [cloud]              │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-               ┌───────────────┼───────────────┐
-               ▼               ▼               ▼
-          ┌────────┐    ┌──────────┐    ┌──────────┐
-          │ vllm-  │    │  Bedrock │    │ Anthropic│
-          │ mlx    │    │  Mantle  │    │  API     │
-          │ (:8770)│    │          │    │          │
-          └────────┘    └──────────┘    └──────────┘
-          Local model   AWS GPU       Cloud
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Features
