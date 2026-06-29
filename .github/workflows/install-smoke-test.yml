@@ -1,0 +1,61 @@
+name: Install smoke test
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  smoke-test:
+    name: macos-26 / stdin-sim
+    runs-on: macos-26
+
+    env:
+      USE_LOCAL_MODELS: "0"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache pip downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('install-model-router.sh') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Run install (stdin simulation — mirrors curl | bash)
+        run: bash <(cat install-model-router.sh) --mode A --local all --model mlx-community/Qwen3-8B-4bit
+
+      - name: Verify bundle files exist
+        run: |
+          test -f ~/model-router/router_config.json
+          test -f ~/model-router/model-router.env
+          test -f ~/model-router/install-model-router.sh
+          test -f ~/model-router/router.py
+          test -f ~/model-router/mcp-local.json
+
+      - name: Verify router_config.json has 4 routes
+        run: |
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open(os.path.expanduser('~/model-router/router_config.json')))
+          n = len(r.get('routes', []))
+          assert n == 4, f'expected 4 routes, got {n}'
+          print(f'OK: {n} routes found')
+          PY
+
+      - name: Verify .zshrc block was written
+        run: |
+          grep -q 'claude-router'        ~/.zshrc
+          grep -q 'claude model routing' ~/.zshrc
+          echo "OK: .zshrc block present"
+
+      - name: Verify venv and packages
+        run: |
+          test -x ~/model-router/venv/bin/python
+          ~/model-router/venv/bin/python -c "import fastapi, uvicorn, httpx; print('OK: packages present')"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          bash ~/model-router/uninstall-model-router.sh 2>/dev/null || rm -rf ~/model-router

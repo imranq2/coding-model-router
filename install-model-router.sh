@@ -69,8 +69,9 @@ GITHUB_REPO="imranq2/coding-model-router"
 GITHUB_BRANCH="main"
 
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" != "$DIR" ]; then
-  # Detect if we're running via curl: SCRIPT_DIR is empty (stdin/pipe) or a system tmp path.
-  if [ -z "$SCRIPT_DIR" ] || [[ "$SCRIPT_DIR" == "/var/folders"* || "$SCRIPT_DIR" == "/tmp"* || "$SCRIPT_DIR" == "/private/tmp"* ]]; then
+  # Detect if we're running via curl/stdin: SCRIPT_DIR is empty, or the files don't actually
+  # exist there (e.g. SCRIPT_DIR=/dev/fd when using `bash <(cat ...)` process substitution).
+  if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/install-model-router.sh" ]; then
     diag "bootstrap path: curl/stdin → downloading from GitHub ($GITHUB_REPO@$GITHUB_BRANCH)"
     echo "[0/6] Downloading script bundle from GitHub..."
     mkdir -p "$DIR"
