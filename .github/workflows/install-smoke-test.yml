@@ -1,0 +1,73 @@
+name: Install smoke test
+
+on:
+  pull_request:
+    paths:
+      - 'install-model-router.sh'
+      - 'start-model-router.sh'
+      - 'stop-model-router.sh'
+      - 'uninstall-model-router.sh'
+      - 'router.py'
+      - 'models.json'
+      - 'mcp-local.json'
+
+jobs:
+  smoke-test:
+    name: ${{ matrix.os }} / ${{ matrix.scenario }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        scenario: [local-file, stdin-sim]
+
+    env:
+      ANTHROPIC_API_KEY: sk-ant-ci-placeholder
+      USE_LOCAL_MODELS: "0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('install-model-router.sh') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Run install (local file)
+        if: matrix.scenario == 'local-file'
+        run: bash install-model-router.sh --mode B
+
+      - name: Run install (stdin simulation — mirrors curl | bash)
+        if: matrix.scenario == 'stdin-sim'
+        run: bash <(cat install-model-router.sh) --mode B
+
+      - name: Verify bundle files exist
+        run: |
+          test -f ~/model-router/router_config.json
+          test -f ~/model-router/model-router.env
+          test -f ~/model-router/install-model-router.sh
+          test -f ~/model-router/router.py
+          test -f ~/model-router/mcp-local.json
+
+      - name: Verify router_config.json has 4 routes
+        run: |
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open(os.path.expanduser('~/model-router/router_config.json')))
+          n = len(r.get('routes', []))
+          assert n == 4, f'expected 4 routes, got {n}'
+          print(f'OK: {n} routes found')
+          PY
+
+      - name: Verify .zshrc block was written
+        run: |
+          grep -q 'claude-router'        ~/.zshrc
+          grep -q 'claude model routing' ~/.zshrc
+          echo "OK: .zshrc block present"
+
+      - name: Verify venv and packages
+        run: |
+          test -x ~/model-router/venv/bin/python
+          ~/model-router/venv/bin/python -c "import fastapi, uvicorn, httpx; print('OK: packages present')"
