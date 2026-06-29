@@ -18,12 +18,12 @@ to `superseded/` and add a pointer banner at the top.
 
 ## 👉 Active (in flight)
 
-- **[`plans/active/2026-06-29-github-ci-macos-smoke-test.md`](plans/active/2026-06-29-github-ci-macos-smoke-test.md)**
-  — GitHub Actions macOS smoke test for `install-model-router.sh` on every PR.
+_(none)_
 
 ## Implemented (shipped — see `plans/implemented/`)
 
-_(none yet)_
+- **[`plans/implemented/2026-06-29-github-ci-macos-smoke-test.md`](plans/implemented/2026-06-29-github-ci-macos-smoke-test.md)**
+  — GitHub Actions macOS smoke test for `install-model-router.sh` on every PR.
 
 ## Superseded (historical — see `plans/superseded/`)
 
