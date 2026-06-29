@@ -33,7 +33,7 @@
       "price_per_mtok":   0,
       "fit_32gb":         "✅",
       "fit_16gb":         "✅",
-      "reason":           "256K ctx; thinking token leak [1]"
+      "reason":           "256K ctx; thinking suppressed via chat_template_kwargs"
     },
     {
       "id":               "mlx-community/Qwen3-14B-4bit",
