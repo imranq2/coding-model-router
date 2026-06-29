@@ -1,16 +1,15 @@
-name: Install smoke test
+name: Install smoke test (local models)
 
 on:
   workflow_dispatch:
-  pull_request:
 
 jobs:
-  smoke-test:
-    name: macos-26 / stdin-sim
-    runs-on: macos-26
+  smoke-test-local:
+    name: macos-26-xlarge / local inference
+    runs-on: macos-26-xlarge
 
     env:
-      USE_LOCAL_MODELS: "0"
+      USE_LOCAL_MODELS: "1"
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
@@ -22,6 +21,12 @@ jobs:
           path: ~/Library/Caches/pip
           key: pip-${{ runner.os }}-${{ hashFiles('install-model-router.sh') }}
           restore-keys: pip-${{ runner.os }}-
+
+      - name: Cache HuggingFace model
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-Qwen3-8B-4bit
 
       - name: Run install (stdin simulation — mirrors curl | bash)
         run: bash <(cat install-model-router.sh) --mode A --local all --model mlx-community/Qwen3-8B-4bit
@@ -54,6 +59,20 @@ jobs:
         run: |
           test -x ~/model-router/venv/bin/python
           ~/model-router/venv/bin/python -c "import fastapi, uvicorn, httpx; print('OK: packages present')"
+
+      - name: Start model router stack
+        run: bash ~/model-router/start-model-router.sh &
+
+      - name: Wait for router to be ready
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8771/health && break
+            sleep 5
+          done
+          curl -sf http://localhost:8771/health || { echo "ERROR: router not ready after 5 min"; exit 1; }
+
+      - name: Run inference smoke test
+        run: python3 test-vllm-mlx.py --port 8770 --model mlx-community/Qwen3-8B-4bit
 
       - name: Cleanup
         if: always()
