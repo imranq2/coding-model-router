@@ -1,6 +1,7 @@
 name: Install smoke test
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - 'install-model-router.sh'
@@ -10,6 +11,7 @@ on:
       - 'router.py'
       - 'models.json'
       - 'mcp-local.json'
+      - '.github/workflows/install-smoke-test.yml'
 
 jobs:
   smoke-test:
