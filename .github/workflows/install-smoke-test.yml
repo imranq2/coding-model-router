@@ -10,7 +10,6 @@ jobs:
     runs-on: macos-latest
 
     env:
-      ANTHROPIC_API_KEY: sk-ant-ci-placeholder
       USE_LOCAL_MODELS: "0"
 
     steps:
@@ -24,7 +23,7 @@ jobs:
           restore-keys: pip-${{ runner.os }}-
 
       - name: Run install (stdin simulation — mirrors curl | bash)
-        run: bash <(cat install-model-router.sh) --mode B
+        run: bash <(cat install-model-router.sh) --mode A --local all --model mlx-community/Qwen3.5-9B-MLX-4bit
 
       - name: Verify bundle files exist
         run: |
