@@ -45,22 +45,33 @@ set -euo pipefail
 DIR="$HOME/model-router"; mkdir -p "$DIR"
 ENVF="$DIR/model-router.env"
 
+# Diagnostic logger — always prints to stderr so it never pollutes $() captures.
+# Set MODEL_ROUTER_DEBUG=1 for extra verbosity (env dump, python path, etc.).
+diag() { printf '[diag] %s\n' "$*" >&2; }
+
 # Self-bootstrap: when run from the skill's scripts/ bundle, copy the whole bundle into
 # ~/model-router so the start/stop/uninstall scripts + tag_logger live alongside this one.
 # When re-run from ~/model-router (via the alias), this is a no-op.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_CONFIG="$SCRIPT_DIR/models.json"
+# When piped via `curl | bash`, BASH_SOURCE[0] is unset (bash never populates it for stdin
+# scripts). Guard with :-  and treat an empty result as the curl/stdin case.
+_bs="${BASH_SOURCE[0]:-}"
+if [ -n "$_bs" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$_bs")" && pwd)"
+  diag "script source: file — SCRIPT_DIR=$SCRIPT_DIR"
+else
+  SCRIPT_DIR=""  # curl/stdin mode — files must be fetched from GitHub
+  diag "script source: stdin/curl (BASH_SOURCE unset) — will download from GitHub"
+fi
+MODELS_CONFIG="${SCRIPT_DIR:+$SCRIPT_DIR/}models.json"
 
 # GitHub repo for fetching additional files when run via curl
 GITHUB_REPO="imranq2/coding-model-router"
 GITHUB_BRANCH="main"
 
-# Self-bootstrap: when run from the skill's scripts/ bundle, copy the whole bundle into
-# ~/model-router so the start/stop/uninstall scripts + tag_logger live alongside this one.
-# When run via curl, fetch all files from GitHub.
-if [ "$SCRIPT_DIR" != "$DIR" ]; then
-  # Detect if we're running via curl (SCRIPT_DIR is /var/folders or /tmp)
-  if [[ "$SCRIPT_DIR" == "/var/folders"* || "$SCRIPT_DIR" == "/tmp"* || "$SCRIPT_DIR" == "/private/tmp"* ]]; then
+if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" != "$DIR" ]; then
+  # Detect if we're running via curl: SCRIPT_DIR is empty (stdin/pipe) or a system tmp path.
+  if [ -z "$SCRIPT_DIR" ] || [[ "$SCRIPT_DIR" == "/var/folders"* || "$SCRIPT_DIR" == "/tmp"* || "$SCRIPT_DIR" == "/private/tmp"* ]]; then
+    diag "bootstrap path: curl/stdin → downloading from GitHub ($GITHUB_REPO@$GITHUB_BRANCH)"
     echo "[0/6] Downloading script bundle from GitHub..."
     mkdir -p "$DIR"
 
@@ -87,6 +98,7 @@ if [ "$SCRIPT_DIR" != "$DIR" ]; then
     SCRIPT_DIR="$DIR"
     MODELS_CONFIG="$DIR/models.json"
   else
+    diag "bootstrap path: local bundle → copying from $SCRIPT_DIR"
     echo "[0/6] Copying script bundle to $DIR ..."
     cp "$SCRIPT_DIR/"*.sh "$SCRIPT_DIR/router.py" "$SCRIPT_DIR/models.json" "$SCRIPT_DIR/mcp-local.json" "$DIR/"
     # The .whl is tracked in git but guard against a shallow clone / manual extraction.
@@ -94,6 +106,8 @@ if [ "$SCRIPT_DIR" != "$DIR" ]; then
       cp "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" "$DIR/"
     chmod +x "$DIR"/*.sh
   fi
+else
+  diag "bootstrap path: already in $DIR (re-run or alias invocation)"
 fi
 
 # Defaults (overridden by a prior install's env, then by flags).
@@ -131,7 +145,13 @@ AWS_PROFILE_NAME=""            # --aws-profile: AWS (SSO) profile boto3 resolves
 
 # Reuse prior values on a bare re-run.
 # shellcheck source=/dev/null
-[ -f "$ENVF" ] && . "$ENVF"
+if [ -f "$ENVF" ]; then
+  diag "loading prior env: $ENVF"
+  . "$ENVF"
+  [ "${MODEL_ROUTER_DEBUG:-0}" = "1" ] && grep -v '^\s*#' "$ENVF" | grep -v '^\s*$' | while IFS= read -r _l; do diag "  env: $_l"; done || true
+else
+  diag "no prior env found at $ENVF (first install)"
+fi
 
 # Tiers are named by COMPLEXITY for the user; Claude Code itself uses model-family names, so we
 # map: low→haiku (background/simple), medium→sonnet (daily coding), high→opus (hard reasoning),
@@ -205,24 +225,50 @@ done
 
 # ---- Auto-detect anything not supplied via flags or a prior env ----
 detect_mode() {  # prints A (subscription), B (api key), or "" (neither)
-  command -v python3 >/dev/null 2>&1 || { echo ""; return; }
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '[diag] detect_mode: python3 not found — cannot check auth\n' >&2
+    echo ""; return
+  fi
   python3 - <<'PY'
-import json, os
+import json, os, sys
+
+def diag(msg):
+    print(f"[diag] {msg}", file=sys.stderr)
+
 oauth = False
 try:
-    oauth = bool((json.load(open(os.path.expanduser("~/.claude.json"))) or {}).get("oauthAccount"))
+    data = json.load(open(os.path.expanduser("~/.claude.json"))) or {}
+    oauth = bool(data.get("oauthAccount"))
+    if oauth:
+        diag("detect_mode: found OAuth account in ~/.claude.json → Mode A")
+    else:
+        diag("detect_mode: ~/.claude.json present but no oauthAccount key")
+except FileNotFoundError:
+    diag("detect_mode: ~/.claude.json not found (not logged in to Claude Code)")
 except Exception as e:
-    # Expected when ~/.claude.json is missing or unreadable; log for debugging
-    print(f"Debug: could not read ~/.claude.json: {e}", file=__import__('sys').stderr)
+    diag(f"detect_mode: could not read ~/.claude.json: {e}")
+
 key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+if key:
+    diag("detect_mode: ANTHROPIC_API_KEY set in environment → Mode B candidate")
 if not key:
     try:
         s = json.load(open(os.path.expanduser("~/.claude/settings.json")))
         key = "ANTHROPIC_API_KEY" in (s.get("env") or {})
-    except Exception:
-        pass
+        if key:
+            diag("detect_mode: ANTHROPIC_API_KEY found in ~/.claude/settings.json → Mode B candidate")
+        else:
+            diag("detect_mode: ~/.claude/settings.json present but no ANTHROPIC_API_KEY in env block")
+    except FileNotFoundError:
+        diag("detect_mode: ~/.claude/settings.json not found")
+    except Exception as e:
+        diag(f"detect_mode: could not read ~/.claude/settings.json: {e}")
+
 # Prefer subscription when logged in, so a stray key doesn't flip to paid API billing.
-print("A" if oauth else ("B" if key else ""))
+result = "A" if oauth else ("B" if key else "")
+if not result:
+    diag("detect_mode: no auth found — will error unless --mode A|B passed")
+print(result)
 PY
 }
 # ---------------------------------------------------------------------------
@@ -663,14 +709,21 @@ prompt_prompt_cache() {  # interactive picker for --prompt-cache-bytes. Echoes c
   fi
 }
 free_port() {  # first free port at or above $1
-  local p="$1"
-  while lsof -i ":$p" -sTCP:LISTEN >/dev/null 2>&1; do p=$(( p + 1 )); done
+  local p="$1" bumped=0
+  while lsof -i ":$p" -sTCP:LISTEN >/dev/null 2>&1; do
+    diag "port $p busy — bumping to $(( p + 1 ))"
+    p=$(( p + 1 )); bumped=1
+  done
+  [ "$bumped" = "0" ] && diag "port $p free" || diag "port settled at $p"
   echo "$p"
 }
 # Load all model data from models.json into shell variables (one Python call; fast thereafter).
 _init_model_config
 
 [ -n "$MODE" ]     || { MODE="$(detect_mode || true)"; AUTO_MODE=1; }
+diag "auth mode: ${MODE:-UNDETECTED}${AUTO_MODE:+ (auto-detected)}${AUTO_MODE:-} "
+_ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+diag "system RAM: ${_ram_gb}GB"
 
 # Ask whether to use local models (vllm-mlx). Only prompt on a TTY when not already saved.
 if [ -t 0 ] && [ -z "${USE_LOCAL_MODELS:-}" ]; then
@@ -698,6 +751,7 @@ if [ "${USE_LOCAL_MODELS}" = "1" ]; then
   fi
 fi
 if [ "$MODE" = "B" ] && [ -z "$ANTHROPIC_KEY" ]; then ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"; fi
+[ "${USE_LOCAL_MODELS}" = "1" ] && diag "local model selected: $MODEL_ID"
 
 # Interactive local-model prompts (max-tokens, autocompact, prompt-cache) — only needed when
 # a local model is actually used.
@@ -722,6 +776,7 @@ if [ "${USE_LOCAL_MODELS}" = "1" ] && [ "$ACW" = "auto" ]; then
   _win="$(model_ctx "$MODEL_ID")"; [ -n "$_win" ] || _win=131072   # model window (128K fallback)
   _cap="$(ram_window_cap)"                                          # what this Mac's RAM can hold
   ACW=$(( _win < _cap ? _win : _cap ))                              # min — bound by the tighter limit
+  diag "compact window: model=${_win} tokens, ram_cap=${_cap} tokens → ACW=${ACW}"
 fi
 
 [ "${USE_LOCAL_MODELS}" = "1" ] && MLX_PORT="$(free_port "$MLX_PORT")"
@@ -864,8 +919,12 @@ pick_python() {
   fi
 }
 PYBIN="$(pick_python)"
-[ -n "$PYBIN" ] || { echo "ERROR: need Python $PY_PREFERRED (or 3.10–3.13) to build the venv (default python3 is $(python3 --version 2>&1)). Install it, e.g. 'brew install python@$PY_PREFERRED'." >&2; exit 2; }
+if [ -z "$PYBIN" ]; then
+  diag "python: none of python${PY_PREFERRED}/3.13/3.11/3.10 found; default python3=$(python3 --version 2>&1 || echo missing)"
+  echo "ERROR: need Python $PY_PREFERRED (or 3.10–3.13) to build the venv (default python3 is $(python3 --version 2>&1)). Install it, e.g. 'brew install python@$PY_PREFERRED'." >&2; exit 2
+fi
 PY_VER="$("$PYBIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+diag "python selected: $PYBIN (v$PY_VER, preferred=$PY_PREFERRED)"
 
 # Rebuild the venv whenever it was built on a different Python than the one we picked — this
 # heals both a too-new interpreter (a prior 3.14 attempt) and a version drift (e.g. an old
@@ -873,9 +932,14 @@ PY_VER="$("$PYBIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 if [ -x "$VENV/bin/python" ]; then
   EXISTING_VER="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "?")"
   if [ "$EXISTING_VER" != "$PY_VER" ]; then
+    diag "venv: Python mismatch (existing=$EXISTING_VER, target=$PY_VER) — rebuilding"
     echo "  Rebuilding venv: existing Python $EXISTING_VER != target $PY_VER."
     rm -rf "$VENV"
+  else
+    diag "venv: existing venv matches Python $PY_VER — reusing"
   fi
+else
+  diag "venv: no existing venv at $VENV — will create"
 fi
 
 if [ "${USE_LOCAL_MODELS}" = "1" ]; then
