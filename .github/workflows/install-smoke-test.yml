@@ -3,15 +3,6 @@ name: Install smoke test
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - 'install-model-router.sh'
-      - 'start-model-router.sh'
-      - 'stop-model-router.sh'
-      - 'uninstall-model-router.sh'
-      - 'router.py'
-      - 'models.json'
-      - 'mcp-local.json'
-      - '.github/workflows/install-smoke-test.yml'
 
 jobs:
   smoke-test:
