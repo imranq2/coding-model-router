@@ -73,15 +73,6 @@ if [ "$SCRIPT_DIR" != "$DIR" ]; then
       fi
     done
 
-    # Download the wheel if available (GitHub releases or main branch)
-    if curl -sfI "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/vllm_mlx-0.4.0-py3-none-any.whl" | head -1 | grep -q "200"; then
-      curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/vllm_mlx-0.4.0-py3-none-any.whl" -o "$DIR/vllm_mlx-0.4.0-py3-none-any.whl"
-      echo "  Fetching vllm_mlx-0.4.0-py3-none-any.whl..."
-    else
-      # Wheel not available on GitHub, will fetch from PyPI during install
-      echo "  (vllm_mlx wheel not found on GitHub - will install from PyPI)"
-    fi
-
     chmod +x "$DIR"/*.sh
     # Update SCRIPT_DIR and MODELS_CONFIG to the new location
     SCRIPT_DIR="$DIR"
@@ -89,9 +80,6 @@ if [ "$SCRIPT_DIR" != "$DIR" ]; then
   else
     echo "[0/6] Copying script bundle to $DIR ..."
     cp "$SCRIPT_DIR/"*.sh "$SCRIPT_DIR/router.py" "$SCRIPT_DIR/models.json" "$SCRIPT_DIR/mcp-local.json" "$DIR/"
-    # The .whl is tracked in git but guard against a shallow clone / manual extraction.
-    [ -f "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" ] && \
-      cp "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" "$DIR/"
     chmod +x "$DIR"/*.sh
   fi
 fi
@@ -885,14 +873,8 @@ if [ "${USE_LOCAL_MODELS}" = "1" ]; then
   "$VENV/bin/python" -m pip install -q --upgrade pip
   _extra_pip=""; any_bedrock && _extra_pip="boto3 openai"
   # shellcheck disable=SC2086
-  if [ -f "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" ]; then
-    VLLM_MLX_REPO="$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl"
-  else
-    echo "  (vllm_mlx wheel not found locally — installing from PyPI)"
-    VLLM_MLX_REPO="vllm-mlx==0.4.0"
-  fi
   "$VENV/bin/python" -m pip install -q \
-    "$VLLM_MLX_REPO" \
+    "vllm-mlx==0.4.0" \
     "fastapi>=0.111" "uvicorn[standard]>=0.29" "httpx>=0.27" \
     huggingface_hub $_extra_pip
 else
