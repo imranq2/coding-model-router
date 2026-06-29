@@ -934,12 +934,19 @@ build_route() {
     # max_tokens: written into the route so the router raises Claude Code's conservative cap
     # to the local model's actual context window. Omitted when the user chose "none" (vllm-mlx
     # uses its built-in default and the router won't override).
+    #
+    # chat_template_kwargs: Qwen3 models emit a lengthy reasoning chain by default; setting
+    # enable_thinking=false in the tokenizer template skips it entirely so responses are fast.
+    local _ctk=""
+    if printf '%s' "$MODEL_ID" | grep -qi 'qwen3'; then
+      _ctk=', "chat_template_kwargs": {"enable_thinking": false}'
+    fi
     if [ "$MLX_MAX_TOKENS" = "none" ]; then
-      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "price_per_mtok": 0}' \
-        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID"
+      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "price_per_mtok": 0%s}' \
+        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$_ctk"
     else
-      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "max_tokens": %s, "price_per_mtok": 0}' \
-        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$MLX_MAX_TOKENS"
+      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "max_tokens": %s, "price_per_mtok": 0%s}' \
+        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$MLX_MAX_TOKENS" "$_ctk"
     fi
   elif [ "$be" = "bedrock" ]; then
     # Qwen models (prefix "qwen.") use the OpenAI Chat Completions wire format on Bedrock Mantle;

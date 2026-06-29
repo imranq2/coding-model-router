@@ -1,42 +1,99 @@
 #!/usr/bin/env python3
 """
-model-router/router.py — minimal Anthropic Messages proxy for Claude Code.
+model-router/router.py — Anthropic Messages API proxy for Claude Code.
 
-Routes POST /v1/messages by the `model` field to one of three auth strategies:
-  none        → vllm-mlx at a localhost port (native /v1/messages, no auth needed)
-  passthrough → Anthropic API direct (client Authorization header forwarded verbatim)
-  aws         → AWS Bedrock Mantle (/anthropic/v1/messages, SigV4 signed)
+PURPOSE
+-------
+Claude Code sends every request to a single Anthropic Messages API endpoint.
+This proxy intercepts those requests and re-routes them to cheaper/faster
+backends (local GPU model, AWS Bedrock, or Anthropic direct) based on the
+model name in the request body. This allows mixing local open-weight models,
+cloud models, and direct Anthropic calls transparently.
 
-An optional `api_type` field (default "anthropic") controls the wire protocol:
-  anthropic   → upstream speaks Anthropic Messages API (forward verbatim)
-  openai      → upstream speaks OpenAI Chat Completions API; router translates both
-                request and response on the fly
+ROUTING MODEL
+-------------
+Routes are keyed by `claude_model` (the name Claude Code sends). When a
+request arrives, the router:
+  1. Looks up the route by model name.
+  2. Rewrites the model field to the upstream model name.
+  3. Applies any body mutations (max_tokens, tool name sanitization,
+     chat_template_kwargs injection).
+  4. Forwards to the upstream using the route's auth strategy.
+  5. Streams the response back verbatim (Anthropic routes) or translates
+     it on the fly (OpenAI routes).
 
-Config format (~/model-router/router_config.json):
+AUTH STRATEGIES (route.auth)
+-----------------------------
+  none        → Local vllm-mlx server; no auth needed.
+  passthrough → Anthropic API direct; client Authorization header forwarded as-is.
+  aws         → AWS Bedrock Mantle; SigV4-signed per request.
+
+WIRE PROTOCOLS (route.api_type, default "anthropic")
+-----------------------------------------------------
+  anthropic   → Upstream speaks Anthropic Messages API. Bytes forwarded verbatim.
+  openai      → Upstream speaks OpenAI Chat Completions API. The router translates
+                the request from Anthropic format, then converts the response
+                (including streaming SSE chunks) back to Anthropic format.
+
+ROUTE CONFIG SCHEMA (~/model-router/router_config.json)
+--------------------------------------------------------
+Required fields:
+  claude_model          Model name Claude Code sends (e.g. "claude-haiku-4-5-20251001")
+  url                   Full upstream endpoint URL
+  model                 Upstream model name (replaces claude_model in request body)
+  auth                  Auth strategy: "none" | "passthrough" | "aws"
+
+Optional fields:
+  api_type              Wire protocol: "anthropic" (default) | "openai"
+  aws_region            AWS region for Bedrock routes (default "us-east-1")
+  tier                  Display tier: "haiku" | "sonnet" | "opus" | "fable"
+                        Used for cost tracking labels only.
+  price_per_mtok        Cost per million tokens for savings reporting (default 0)
+  max_tokens            For local routes: ceiling (prevent KV-cache OOM).
+                        For remote routes: floor (override Claude Code's 8K cap).
+  chat_template_kwargs  Extra kwargs passed to the tokenizer's apply_chat_template.
+                        For Qwen3 local routes: {"enable_thinking": false} disables
+                        the reasoning chain, preventing slow "Thinking Process:" output.
+
+EXAMPLE CONFIG
+--------------
   { "routes": [
-      { "claude_model": "claude-haiku-4-5-20251001",
+      { "tier": "haiku",
+        "claude_model": "claude-haiku-4-5-20251001",
         "url": "http://localhost:8770/v1/messages",
-        "model": "mlx-community/gemma-4-e4b-it-4bit",
-        "auth": "none" },
-      { "claude_model": "claude-sonnet-4-6",
-        "url": "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages",
-        "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "auth": "aws", "aws_region": "us-east-1" },
-      { "claude_model": "claude-sonnet-4-6",
+        "model": "mlx-community/Qwen3.5-9B-MLX-4bit",
+        "auth": "none",
+        "price_per_mtok": 0,
+        "chat_template_kwargs": {"enable_thinking": false} },
+      { "tier": "sonnet",
+        "claude_model": "claude-sonnet-4-6",
         "url": "https://bedrock-mantle.us-east-1.api.aws/v1/chat/completions",
         "model": "qwen.qwen3-coder-30b-a3b-v1:0",
-        "auth": "aws", "aws_region": "us-east-1", "api_type": "openai" },
-      { "claude_model": "claude-opus-4-8",
+        "auth": "aws", "aws_region": "us-east-1", "api_type": "openai",
+        "price_per_mtok": 0.5 },
+      { "tier": "opus",
+        "claude_model": "claude-opus-4-8",
         "url": "https://api.anthropic.com/v1/messages",
         "model": "claude-opus-4-8",
-        "auth": "passthrough" }
+        "auth": "passthrough",
+        "price_per_mtok": 5.0 }
   ] }
 
-For anthropic routes: request body and response bytes are forwarded verbatim.
-For openai routes: Anthropic Messages ↔ OpenAI Chat Completions translation is applied
-using the openai Python SDK as the HTTP client. SigV4 signing is handled transparently
-via an httpx.Auth subclass that fires on every SDK request.
-All non-Authorization client headers are forwarded to upstream.
+THINKING SUPPRESSION
+--------------------
+Qwen3 reasoning models emit thinking chains by default. There are two separate
+suppression mechanisms, one for each code path:
+
+  Local routes (auth="none", vllm-mlx):
+    The router injects chat_template_kwargs: {"enable_thinking": false} from the
+    route config. vllm-mlx passes this to the tokenizer's Jinja2 chat template,
+    which omits the <think> scaffolding — no thinking tokens are ever generated.
+
+  Bedrock OpenAI routes (api_type="openai"):
+    The _ThinkingStripper class strips <think>…</think> blocks from the streamed
+    output. The model has already generated thinking tokens, but they are removed
+    before being forwarded to Claude Code. This approach is used because Bedrock
+    does not expose a pre-generation enable_thinking parameter.
 """
 from __future__ import annotations
 
@@ -221,11 +278,14 @@ _OAI_TO_ANT_STOP = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max
 
 
 class _ThinkingStripper:
-    """Strip <think>…</think> reasoning blocks from streamed Qwen/reasoning model output.
+    """Strip <think>…</think> blocks from streamed output on Bedrock OpenAI routes.
 
-    Qwen3 models emit thinking inside <think> tags in the content field (not in a
-    separate reasoning block).  This class processes text incrementally so that tag
-    boundaries that fall mid-chunk are handled correctly across multiple feed() calls.
+    Used only for api_type="openai" routes where the model has already generated
+    thinking tokens — see "THINKING SUPPRESSION" in the module docstring for why
+    this path exists alongside the chat_template_kwargs approach for local routes.
+
+    Processes text incrementally so tag boundaries that fall mid-chunk are handled
+    correctly across multiple feed() calls.
     """
 
     _OPEN = "<think>"
@@ -303,12 +363,18 @@ def _msg_id() -> str:
 # Per-model cumulative token counters {upstream_model: {"input": int, "output": int, "price_per_mtok": float}}
 _token_stats: dict[str, dict] = {}
 
-
+# Maps tier names to short display labels used in the status line (e.g. "haiku" → "low").
 _TIER_LABEL = {"haiku": "low", "sonnet": "med", "opus": "high", "fable": "top"}
 _TIER_ORDER = ["low", "med", "high", "top"]
 
 
 def _record_tokens(upstream_model: str, in_tok: int, out_tok: int, price_per_mtok: float, backend_label: str, tier: str = "") -> None:
+    """Update cumulative stats and emit a compact status line.
+
+    Detailed per-model breakdown goes to the log file (stderr).
+    A one-line tier summary overwrites the current terminal line on stdout —
+    this is the "savings ticker" visible while Claude Code is running.
+    """
     log.info(
         "[model-router] tokens  in=%-6d out=%-6d backend=%-12s model=%s",
         in_tok, out_tok, backend_label, upstream_model,
@@ -725,6 +791,16 @@ async def health():
 @app.post("/v1/messages")
 @app.post("/v1/messages/count_tokens")
 async def proxy_messages(request: Request) -> StreamingResponse:
+    """Handle all Claude Code API requests and route them to the appropriate backend.
+
+    Flow:
+      1. Route lookup    — find config for the requested model (fallback: Anthropic direct).
+      2. Body mutations  — rewrite model name, enforce max_tokens, sanitize tool names,
+                           inject chat_template_kwargs (local routes).
+      3. Header building — auth strategy determines upstream Authorization header.
+      4. Dispatch        — OpenAI routes use the openai SDK + Anthropic translation;
+                           Anthropic/local routes stream bytes verbatim via httpx.
+    """
     raw_body = await request.body()
 
     try:
@@ -807,6 +883,14 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         elif body_json.get("max_tokens", 0) < route_max_tokens:
             body_json["max_tokens"] = route_max_tokens
             body_changed = True
+
+    # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
+    # to disable the reasoning chain that would otherwise appear as visible output).
+    route_chat_template_kwargs: dict | None = route.get("chat_template_kwargs")
+    if route_chat_template_kwargs and api_type != "openai":
+        merged = {**route_chat_template_kwargs, **body_json.get("chat_template_kwargs", {})}
+        body_json["chat_template_kwargs"] = merged
+        body_changed = True
 
     if api_type == "openai":
         # Translate Anthropic → OpenAI; re-encode immediately.
