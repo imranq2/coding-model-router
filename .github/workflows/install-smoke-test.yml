@@ -7,7 +7,7 @@ on:
 jobs:
   smoke-test:
     name: macos-latest / stdin-sim
-    runs-on: macos-latest
+    runs-on: macos-26
 
     env:
       USE_LOCAL_MODELS: "0"
