@@ -10,16 +10,20 @@ models in CI.
 
 ## Runner choice
 
-Use `macos-15` (Apple Silicon, M1) as the primary runner — it's what most users of this
-project have, and mlx/vllm-mlx only works on Apple Silicon anyway. Add `macos-26` as a
-second matrix entry; the linked announcement currently shows it as Intel-only, so it's
-useful for validating broad macOS compatibility but cannot test the local-model path.
+Both `macos-15` and `macos-26` are arm64 M1 (3 vCPU, 7 GB RAM) — confirmed from the
+GitHub-hosted runner specs. Both are Apple Silicon, which means both can eventually test
+the local-model (MLX) path, not just the install infrastructure. Use both in a matrix so
+PRs catch macOS-version-specific breakage:
 
 ```yaml
 strategy:
   matrix:
     os: [macos-15, macos-26]
 ```
+
+Intel runners (`macos-15-intel`, `macos-26-intel`) are deliberately excluded: vllm-mlx /
+MLX only works on Apple Silicon, and the Intel variants offer no additional coverage for
+this project's use case.
 
 ---
 
@@ -128,7 +132,7 @@ The venv is fast to recreate once wheels are cached:
 - **Bedrock routes** — requires AWS SSO session; not suitable for PR CI.
 - **`claude-router` actually starting** — requires a live API key and running servers;
   out of scope for the install smoke test.
-- **`macos-26` Apple Silicon** — not yet available; revisit when confirmed.
+- **`macos-26` Apple Silicon** — available and included in the matrix.
 
 ---
 
