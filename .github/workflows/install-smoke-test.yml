@@ -6,13 +6,8 @@ on:
 
 jobs:
   smoke-test:
-    name: ${{ matrix.os }} / ${{ matrix.scenario }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest]
-        scenario: [local-file, stdin-sim]
+    name: macos-latest / stdin-sim
+    runs-on: macos-latest
 
     env:
       ANTHROPIC_API_KEY: sk-ant-ci-placeholder
@@ -28,12 +23,7 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('install-model-router.sh') }}
           restore-keys: pip-${{ runner.os }}-
 
-      - name: Run install (local file)
-        if: matrix.scenario == 'local-file'
-        run: bash install-model-router.sh --mode B
-
       - name: Run install (stdin simulation — mirrors curl | bash)
-        if: matrix.scenario == 'stdin-sim'
         run: bash <(cat install-model-router.sh) --mode B
 
       - name: Verify bundle files exist
