@@ -1,0 +1,1061 @@
+#!/usr/bin/env python3
+"""
+model-router/router.py — minimal Anthropic Messages proxy for Claude Code.
+
+Routes POST /v1/messages by the `model` field to one of three auth strategies:
+  none        → vllm-mlx at a localhost port (native /v1/messages, no auth needed)
+  passthrough → Anthropic API direct (client Authorization header forwarded verbatim)
+  aws         → AWS Bedrock Mantle (/anthropic/v1/messages, SigV4 signed)
+
+An optional `api_type` field (default "anthropic") controls the wire protocol:
+  anthropic   → upstream speaks Anthropic Messages API (forward verbatim)
+  openai      → upstream speaks OpenAI Chat Completions API; router translates both
+                request and response on the fly
+
+Config format (~/model-router/router_config.json):
+  { "routes": [
+      { "claude_model": "claude-haiku-4-5-20251001",
+        "url": "http://localhost:8770/v1/messages",
+        "model": "mlx-community/gemma-4-e4b-it-4bit",
+        "auth": "none" },
+      { "claude_model": "claude-sonnet-4-6",
+        "url": "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages",
+        "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "auth": "aws", "aws_region": "us-east-1" },
+      { "claude_model": "claude-sonnet-4-6",
+        "url": "https://bedrock-mantle.us-east-1.api.aws/v1/chat/completions",
+        "model": "qwen.qwen3-coder-30b-a3b-v1:0",
+        "auth": "aws", "aws_region": "us-east-1", "api_type": "openai" },
+      { "claude_model": "claude-opus-4-8",
+        "url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-opus-4-8",
+        "auth": "passthrough" }
+  ] }
+
+For anthropic routes: request body and response bytes are forwarded verbatim.
+For openai routes: Anthropic Messages ↔ OpenAI Chat Completions translation is applied
+using the openai Python SDK as the HTTP client. SigV4 signing is handled transparently
+via an httpx.Auth subclass that fires on every SDK request.
+All non-Authorization client headers are forwarded to upstream.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+from pathlib import Path
+from typing import AsyncGenerator
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+# Logs go to stderr — start-model-router.sh redirects stderr to the log file.
+# stdout is reserved for the live status line only.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stderr,
+)
+log = logging.getLogger("model-router")
+
+_STDOUT_IS_TTY = sys.stdout.isatty()
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path(
+    os.environ.get("ROUTER_CONFIG", Path.home() / "model-router" / "router_config.json")
+)
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+try:
+    CONFIG: dict = load_config()
+except FileNotFoundError:
+    log.error(
+        "[model-router] config not found at %s — run install-model-router first; starting with no routes",
+        CONFIG_PATH,
+    )
+    CONFIG = {"routes": []}
+
+# Key routes by claude_model (what Claude Code sends) for O(1) lookup.
+# Warn on duplicates rather than silently dropping earlier entries.
+ROUTES: dict[str, dict] = {}
+for _r in CONFIG.get("routes", []):
+    _key = _r["claude_model"]
+    if _key in ROUTES:
+        log.warning("[model-router] duplicate route for model '%s' — later entry wins", _key)
+    ROUTES[_key] = _r
+
+
+def find_route(model: str) -> dict | None:
+    return ROUTES.get(model)
+
+
+# Reference price for savings comparison — read from the opus route in config, fallback to $5/MTok.
+_OPUS_PRICE_PER_MTOK: float = next(
+    (float(r.get("price_per_mtok", 5.0)) for r in CONFIG.get("routes", []) if r.get("tier") == "opus"),
+    5.0,
+)
+
+
+# ---------------------------------------------------------------------------
+# Tool name sanitization for local (vllm-mlx) routes
+# ---------------------------------------------------------------------------
+
+_VALID_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """Map an arbitrary tool name to one that satisfies ^[A-Za-z0-9_-]{1,64}$."""
+    sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    if len(sanitized) <= 64:
+        return sanitized
+    # Stable 64-char form: first 55 chars + '_' + 8-char SHA-256 prefix
+    h = hashlib.sha256(name.encode()).hexdigest()[:8]
+    return sanitized[:55] + "_" + h
+
+
+def _sanitize_tools(body_json: dict) -> tuple[dict, dict]:
+    """Sanitize tool names for vllm-mlx's [A-Za-z0-9_-]{1,64} constraint.
+
+    Returns (modified_body_json, {sanitized_name: original_name}).
+    Only entries that needed sanitization appear in the map.
+    """
+    tools = body_json.get("tools")
+    if not tools:
+        return body_json, {}
+
+    mapping: dict[str, str] = {}
+    new_tools: list = []
+    used: set[str] = set()
+
+    for tool in tools:
+        original_name = tool.get("name", "")
+        if _VALID_TOOL_NAME_RE.match(original_name):
+            new_tools.append(tool)
+            used.add(original_name)
+        else:
+            sanitized = _sanitize_tool_name(original_name)
+            base, i = sanitized, 1
+            while sanitized in used:
+                suffix = f"_{i}"
+                sanitized = base[: 64 - len(suffix)] + suffix
+                i += 1
+            used.add(sanitized)
+            mapping[sanitized] = original_name
+            new_tools.append({**tool, "name": sanitized})
+
+    if not mapping:
+        return body_json, {}
+    return {**body_json, "tools": new_tools}, mapping
+
+
+# ---------------------------------------------------------------------------
+# SigV4 signing for Bedrock Mantle
+# ---------------------------------------------------------------------------
+
+
+def _sign_bedrock(url: str, body: bytes, route: dict) -> dict:
+    """Return a headers dict with AWS SigV4 Authorization for a Bedrock POST."""
+    import boto3
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    # Profile comes from AWS_PROFILE env var (set in the user's shell before starting the router).
+    # Not stored in router_config.json so the config is shareable without exposing profile names.
+    profile = os.environ.get("AWS_PROFILE")
+    region = route.get("aws_region", "us-east-1")
+
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    creds = session.get_credentials().get_frozen_credentials()
+    req = AWSRequest(
+        method="POST",
+        url=url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    SigV4Auth(creds, "bedrock", region).add_auth(req)
+    return dict(req.headers)
+
+
+# ---------------------------------------------------------------------------
+# SigV4 httpx.Auth — applied per-request by the openai SDK's underlying transport
+# ---------------------------------------------------------------------------
+
+
+class _SigV4Auth(httpx.Auth):
+    """Apply AWS SigV4 signing to every request the openai SDK makes.
+
+    httpx calls auth_flow synchronously before each send. At that point the
+    openai SDK has already serialised the body to bytes, so request.content is
+    available for body-hash computation.
+    """
+
+    def __init__(self, route: dict) -> None:
+        self._route = route
+
+    def auth_flow(self, request: httpx.Request):
+        signed = _sign_bedrock(str(request.url), request.content, self._route)
+        for k, v in signed.items():
+            request.headers[k.lower()] = v
+        yield request
+
+
+# ---------------------------------------------------------------------------
+# OpenAI <-> Anthropic translation (for api_type: "openai" routes)
+# ---------------------------------------------------------------------------
+
+# finish_reason/stop_reason mappings
+_OAI_TO_ANT_STOP = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
+
+
+class _ThinkingStripper:
+    """Strip <think>…</think> reasoning blocks from streamed Qwen/reasoning model output.
+
+    Qwen3 models emit thinking inside <think> tags in the content field (not in a
+    separate reasoning block).  This class processes text incrementally so that tag
+    boundaries that fall mid-chunk are handled correctly across multiple feed() calls.
+    """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._inside = False
+
+    def feed(self, text: str) -> str:
+        """Return the visible portion of *text* (thinking content is discarded)."""
+        self._buf += text
+        out: list[str] = []
+
+        while True:
+            if self._inside:
+                end = self._buf.find(self._CLOSE)
+                if end == -1:
+                    self._buf = ""  # still inside thinking block — discard
+                    break
+                self._inside = False
+                self._buf = self._buf[end + len(self._CLOSE):]
+                if self._buf.startswith("\n"):  # drop the newline that typically follows </think>
+                    self._buf = self._buf[1:]
+            else:
+                start = self._buf.find(self._OPEN)
+                if start == -1:
+                    # No open tag — safe to forward up to the point where a partial
+                    # tag prefix could be hiding at the very end of the buffer.
+                    safe = self._safe_forward_len()
+                    out.append(self._buf[:safe])
+                    self._buf = self._buf[safe:]
+                    break
+                out.append(self._buf[:start])
+                self._inside = True
+                self._buf = self._buf[start + len(self._OPEN):]
+
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Return any buffered visible content at stream end.
+
+        Content held back because it might be the start of a <think> tag is
+        safe to forward once the stream is done (a partial tag cannot be completed).
+        If the stream ended mid-think the buffered thinking content is discarded.
+        """
+        if self._inside:
+            self._buf = ""
+            self._inside = False
+            return ""
+        result, self._buf = self._buf, ""
+        return result
+
+    def _safe_forward_len(self) -> int:
+        """Number of leading bytes in self._buf that are safe to forward now.
+
+        Holds back the shortest suffix that could still be a prefix of _OPEN so
+        we never emit a partial '<think' that will turn out to be a tag boundary.
+        """
+        tag = self._OPEN
+        for i in range(1, len(tag)):
+            if self._buf.endswith(tag[:i]):
+                return len(self._buf) - i
+        return len(self._buf)
+
+
+# Headers that are Anthropic-specific and must not be forwarded to OpenAI endpoints
+_ANTHROPIC_ONLY_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "x-api-key"})
+
+
+def _msg_id() -> str:
+    return "msg_" + os.urandom(12).hex()
+
+
+# Per-model cumulative token counters {upstream_model: {"input": int, "output": int, "price_per_mtok": float}}
+_token_stats: dict[str, dict] = {}
+
+
+_TIER_LABEL = {"haiku": "low", "sonnet": "med", "opus": "high", "fable": "top"}
+_TIER_ORDER = ["low", "med", "high", "top"]
+
+
+def _record_tokens(upstream_model: str, in_tok: int, out_tok: int, price_per_mtok: float, backend_label: str, tier: str = "") -> None:
+    log.info(
+        "[model-router] tokens  in=%-6d out=%-6d backend=%-12s model=%s",
+        in_tok, out_tok, backend_label, upstream_model,
+    )
+    entry = _token_stats.setdefault(upstream_model, {"input": 0, "output": 0, "price_per_mtok": price_per_mtok, "tier": tier})
+    entry["input"] += in_tok
+    entry["output"] += out_tok
+    entry["price_per_mtok"] = price_per_mtok
+
+    # Detailed per-model totals → log file only
+    grand_total = sum(s["input"] + s["output"] for s in _token_stats.values())
+    grand_cost = sum((s["input"] + s["output"]) / 1_000_000 * s["price_per_mtok"] for s in _token_stats.values())
+    grand_opus_cost = grand_total / 1_000_000 * _OPUS_PRICE_PER_MTOK
+    log.info("[model-router] ── running totals ──────────────────────────────────────────────────")
+    for mdl, s in _token_stats.items():
+        mtok = s["input"] + s["output"]
+        pct = 100.0 * mtok / grand_total if grand_total else 0.0
+        cost = mtok / 1_000_000 * s["price_per_mtok"]
+        cost_str = "FREE    " if s["price_per_mtok"] == 0 else f"${cost:.4f}"
+        saved = mtok / 1_000_000 * (_OPUS_PRICE_PER_MTOK - s["price_per_mtok"])
+        saved_str = f"  saved ${saved:.4f}" if saved > 0 else ""
+        tier_label = _TIER_LABEL.get(s.get("tier", ""), s.get("tier", ""))
+        log.info("[model-router]   %-4s %-46s %8d tok  %5.1f%%  %s%s", tier_label, mdl[:46], mtok, pct, cost_str, saved_str)
+    total_saved = grand_opus_cost - grand_cost
+    log.info(
+        "[model-router]   %-4s %-46s %8d tok  100.0%%  $%.4f total  (saved $%.4f)",
+        "", "ALL MODELS", grand_total, grand_cost, total_saved,
+    )
+
+    # Compact tier summary → stdout, single updating line
+    by_tier: dict[str, dict] = {}
+    for s in _token_stats.values():
+        label = _TIER_LABEL.get(s.get("tier", ""), s.get("tier", "") or "?")
+        e = by_tier.setdefault(label, {"tokens": 0, "cost": 0.0, "saved": 0.0})
+        mtok2 = s["input"] + s["output"]
+        e["tokens"] += mtok2
+        e["cost"] += mtok2 / 1_000_000 * s["price_per_mtok"]
+        savings = mtok2 / 1_000_000 * (_OPUS_PRICE_PER_MTOK - s["price_per_mtok"])
+        if savings > 0:
+            e["saved"] += savings
+
+    parts = []
+    for label in _TIER_ORDER:
+        if label not in by_tier:
+            continue
+        e = by_tier[label]
+        cost_str = "FREE" if e["cost"] == 0 else f"${e['cost']:.4f}"
+        parts.append(f"{label}: {e['tokens']:,} tok {cost_str}")
+    total_saved2 = sum(e["saved"] for e in by_tier.values())
+    if total_saved2 > 0:
+        parts.append(f"saved: ${total_saved2:.4f}")
+    line = "  |  ".join(parts)
+    if _STDOUT_IS_TTY:
+        print(f"\033[2K\r{line}", end="", flush=True)
+    else:
+        print(line, flush=True)
+
+
+def _sse_event(event_type: str, data: dict) -> bytes:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def _anthropic_content_to_text(content) -> str:
+    """Flatten Anthropic content (str or list of blocks) to a plain string."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+
+
+def _anthropic_to_openai_request(body_json: dict) -> dict:
+    """Translate an Anthropic Messages API request body to OpenAI Chat Completions format."""
+    oai: dict = {"model": body_json["model"]}
+
+    for field in ("stream", "temperature", "top_p", "max_tokens"):
+        if field in body_json:
+            oai[field] = body_json[field]
+
+    messages: list = []
+
+    # System prompt — top-level in Anthropic, becomes role:system in OpenAI
+    if system := body_json.get("system"):
+        messages.append({"role": "system", "content": _anthropic_content_to_text(system)})
+
+    for msg in body_json.get("messages", []):
+        role = msg["role"]
+        content = msg["content"]
+
+        if role == "assistant":
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                tool_calls: list[dict] = []
+                for block in content:
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif btype == "tool_use":
+                        tool_calls.append({
+                            "id": block.get("id", f"call_{len(tool_calls)}"),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": json.dumps(block.get("input", {})),
+                            },
+                        })
+                oai_msg: dict = {"role": "assistant"}
+                if text_parts:
+                    oai_msg["content"] = "\n".join(text_parts)
+                if tool_calls:
+                    oai_msg["tool_calls"] = tool_calls
+                messages.append(oai_msg)
+            else:
+                messages.append({"role": "assistant", "content": content or ""})
+
+        elif role == "user":
+            if isinstance(content, list):
+                # tool_result blocks become separate role:tool messages.
+                # Non-tool-result blocks stay as role:user content.
+                pending: list = []
+                for block in content:
+                    if block.get("type") == "tool_result":
+                        # Flush any accumulated user content first
+                        if pending:
+                            messages.append({"role": "user", "content": _convert_user_content(pending)})
+                            pending = []
+                        result_content = block.get("content", "")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id", ""),
+                            "content": _anthropic_content_to_text(result_content) if isinstance(result_content, list) else str(result_content or ""),
+                        })
+                    else:
+                        pending.append(block)
+                if pending:
+                    messages.append({"role": "user", "content": _convert_user_content(pending)})
+            else:
+                messages.append({"role": "user", "content": content or ""})
+
+    oai["messages"] = messages
+
+    if tools := body_json.get("tools"):
+        oai["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            }
+            for t in tools
+        ]
+
+    if tc := body_json.get("tool_choice"):
+        tc_type = tc.get("type")
+        if tc_type == "auto":
+            oai["tool_choice"] = "auto"
+        elif tc_type == "any":
+            oai["tool_choice"] = "required"
+        elif tc_type == "none":
+            oai["tool_choice"] = "none"
+        elif tc_type == "tool":
+            oai["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+
+    return oai
+
+
+def _convert_user_content(blocks: list) -> str | list:
+    """Convert a list of non-tool-result Anthropic content blocks to OpenAI user content."""
+    text_only = all(b.get("type") == "text" for b in blocks)
+    if text_only:
+        return "\n".join(b.get("text", "") for b in blocks)
+    # Mixed content (e.g. images) — build OpenAI content array
+    result = []
+    for block in blocks:
+        btype = block.get("type")
+        if btype == "text":
+            result.append({"type": "text", "text": block.get("text", "")})
+        elif btype == "image":
+            src = block.get("source", {})
+            if src.get("type") == "base64":
+                url = f"data:{src.get('media_type', 'image/jpeg')};base64,{src.get('data', '')}"
+            else:
+                url = src.get("url", "")
+            result.append({"type": "image_url", "image_url": {"url": url}})
+    return result
+
+
+def _openai_to_anthropic_response(resp_json: dict, msg_id: str, upstream_model: str) -> dict:
+    """Translate a non-streaming OpenAI Chat Completions response to Anthropic format."""
+    usage = resp_json.get("usage", {})
+    content: list = []
+    stop_reason = "end_turn"
+
+    choices = resp_json.get("choices", [])
+    if choices:
+        choice = choices[0]
+        message = choice.get("message", {})
+        stop_reason = _OAI_TO_ANT_STOP.get(choice.get("finish_reason", "stop"), "end_turn")
+
+        if text := message.get("content"):
+            # Qwen3 reasoning models embed <think>…</think> in the content field.
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip("\n").strip()
+            if text:
+                content.append({"type": "text", "text": text})
+
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            try:
+                input_data = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                input_data = {}
+            content.append({
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{len(content):04x}"),
+                "name": fn.get("name", ""),
+                "input": input_data,
+            })
+
+    return {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": upstream_model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+async def _stream_oai_sdk_to_anthropic(
+    stream,  # openai.AsyncStream[ChatCompletionChunk]
+    msg_id: str,
+    upstream_model: str,
+    backend_label: str = "BEDROCK",
+    price_per_mtok: float = 0.0,
+    tier: str = "",
+) -> AsyncGenerator[bytes, None]:
+    """Convert an openai SDK async stream to Anthropic SSE format.
+
+    Uses typed ChatCompletionChunk objects instead of raw SSE text, so there
+    is no manual JSON parsing — field access is via the SDK's dataclass attrs.
+    """
+    sent_message_start = False
+    open_blocks: dict[int, dict] = {}
+    next_idx = 0
+    text_idx: int | None = None
+    tool_idx_map: dict[int, int] = {}  # openai tool index → anthropic block index
+    finish_reason: str | None = None
+    input_tokens = 0
+    output_tokens = 0
+    thinking_stripper = _ThinkingStripper()
+
+    try:
+        async for chunk in stream:
+            if not sent_message_start:
+                sent_message_start = True
+                yield _sse_event("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": upstream_model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 1},
+                    },
+                })
+                yield _sse_event("ping", {"type": "ping"})
+
+            for choice in chunk.choices:
+                delta = choice.delta
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                if delta.content:
+                    visible = thinking_stripper.feed(delta.content)
+                    if visible:
+                        if text_idx is None:
+                            text_idx = next_idx
+                            next_idx += 1
+                            open_blocks[text_idx] = {"type": "text"}
+                            yield _sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": text_idx,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": text_idx,
+                            "delta": {"type": "text_delta", "text": visible},
+                        })
+
+                for tc in delta.tool_calls or []:
+                    oai_tc_idx = tc.index
+                    if oai_tc_idx not in tool_idx_map:
+                        ant_idx = next_idx
+                        next_idx += 1
+                        tool_idx_map[oai_tc_idx] = ant_idx
+                        tc_id = tc.id or f"toolu_{ant_idx:04x}"
+                        tc_name = (tc.function.name if tc.function else "") or ""
+                        open_blocks[ant_idx] = {"type": "tool_use"}
+                        yield _sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": ant_idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tc_id,
+                                "name": tc_name,
+                                "input": {},
+                            },
+                        })
+                    ant_idx = tool_idx_map[oai_tc_idx]
+                    if tc.function and tc.function.arguments:
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": ant_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": tc.function.arguments},
+                        })
+
+            if chunk.usage:
+                if chunk.usage.prompt_tokens is not None:
+                    input_tokens = chunk.usage.prompt_tokens
+                if chunk.usage.completion_tokens is not None:
+                    output_tokens = chunk.usage.completion_tokens
+
+    except Exception as _exc:
+        # Log mid-stream errors but continue to emit the SSE termination events so Claude Code's
+        # parser doesn't hang indefinitely waiting for message_stop.
+        log.error("[model-router] upstream stream error: %s", _exc)
+    finally:
+        await stream.close()
+
+    # Always emit proper SSE termination events — both on clean completion and after errors.
+    # If the stream yielded zero chunks (empty response or early error), synthesize message_start
+    # so what follows is a valid Anthropic SSE sequence.
+    if not sent_message_start:
+        yield _sse_event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": upstream_model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+        yield _sse_event("ping", {"type": "ping"})
+
+    # Flush any text the stripper held back waiting for a possible </think> continuation.
+    remaining = thinking_stripper.flush()
+    if remaining:
+        if text_idx is None:
+            text_idx = next_idx
+            next_idx += 1
+            open_blocks[text_idx] = {"type": "text"}
+            yield _sse_event("content_block_start", {
+                "type": "content_block_start",
+                "index": text_idx,
+                "content_block": {"type": "text", "text": ""},
+            })
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta",
+            "index": text_idx,
+            "delta": {"type": "text_delta", "text": remaining},
+        })
+
+    for idx in sorted(open_blocks):
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": idx})
+
+    stop_reason = _OAI_TO_ANT_STOP.get(finish_reason or "stop", "end_turn")
+    yield _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+    yield _sse_event("message_stop", {"type": "message_stop"})
+    _record_tokens(upstream_model, input_tokens, output_tokens, price_per_mtok, backend_label, tier)
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="model-router", docs_url=None, redoc_url=None)
+
+_SKIP_HEADERS = frozenset({"host", "content-length", "transfer-encoding", "authorization"})
+
+
+def _passthrough_headers(request: Request) -> dict:
+    """All client headers except ones we rebuild ourselves."""
+    return {k: v for k, v in request.headers.items() if k.lower() not in _SKIP_HEADERS}
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Synthetic model list so Claude Code's startup probe doesn't 404."""
+    return {"object": "list", "data": [{"id": m, "object": "model"} for m in ROUTES]}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "routes": len(ROUTES)}
+
+
+@app.post("/v1/messages")
+@app.post("/v1/messages/count_tokens")
+async def proxy_messages(request: Request) -> StreamingResponse:
+    raw_body = await request.body()
+
+    try:
+        body_json = json.loads(raw_body)
+    except json.JSONDecodeError:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    model = body_json.get("model", "")
+    route = find_route(model)
+
+    # Suffix is "" for /v1/messages or "/count_tokens" for the count_tokens endpoint.
+    req_suffix = request.url.path[len("/v1/messages"):]
+
+    if route is None:
+        log.warning("[model-router] unknown model '%s' — forwarding to Anthropic direct", model)
+        route = {
+            "auth": "passthrough",
+            "url": f"https://api.anthropic.com/v1/messages{req_suffix}",
+            "model": model,
+        }
+
+    auth = route["auth"]
+    api_type = route.get("api_type", "anthropic")
+    upstream_model = route["model"]
+    is_streaming = bool(body_json.get("stream"))
+    backend_label = {"none": "LOCAL", "aws": "BEDROCK"}.get(auth, "PASSTHROUGH")
+    price_per_mtok: float = float(route.get("price_per_mtok", 0))
+    tier: str = route.get("tier", "")
+
+    # Neither OpenAI endpoints nor vllm-mlx (Qwen3VL) handle /count_tokens reliably;
+    # return a rough estimate so Claude Code doesn't block on a 500.
+    if req_suffix == "/count_tokens" and (
+        api_type == "openai" or auth == "none"
+    ):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"input_tokens": len(json.dumps(body_json)) // 4})
+
+    # For Anthropic routes the URL has the suffix appended (supports /count_tokens).
+    # For OpenAI routes the URL already points to /v1/chat/completions.
+    if api_type == "openai":
+        target_url = route["url"]
+    else:
+        target_url = route["url"] + req_suffix
+
+    # ── Body mutations ────────────────────────────────────────────────────────
+    body_changed = False
+    if upstream_model != model:
+        body_json["model"] = upstream_model
+        body_changed = True
+
+    # Claude Code caps max_tokens based on the claude model name in the request, which may be
+    # far below what the upstream model actually supports. When the route config specifies
+    # max_tokens, use it as a floor for every route type — local, Bedrock, or passthrough.
+    # When absent from the route config, leave the request unchanged.
+    route_max_tokens: int | None = route.get("max_tokens")
+    tool_name_map: dict[str, str] = {}
+
+    # Tool name sanitization is vllm-mlx specific (local routes only).
+    if auth == "none":
+        body_json, tool_name_map = _sanitize_tools(body_json)
+        if tool_name_map:
+            body_changed = True
+            log.info(
+                "[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map)
+            )
+
+    # Apply max_tokens enforcement.
+    # Local routes (vllm-mlx): ceiling only — lower the request if it exceeds route_max_tokens
+    # (which reflects GPU KV-cache capacity); never raise it, to avoid OOM on small tasks.
+    # Remote routes (Bedrock/passthrough): floor only — raise if below the configured minimum
+    # so Claude Code's 8K cap doesn't truncate output; upstream enforces its own ceiling.
+    if route_max_tokens is not None:
+        if auth == "none":
+            if body_json.get("max_tokens", 0) > route_max_tokens:
+                body_json["max_tokens"] = route_max_tokens
+                body_changed = True
+        elif body_json.get("max_tokens", 0) < route_max_tokens:
+            body_json["max_tokens"] = route_max_tokens
+            body_changed = True
+
+    if api_type == "openai":
+        # Translate Anthropic → OpenAI; re-encode immediately.
+        body_json = _anthropic_to_openai_request(body_json)
+        raw_body = json.dumps(body_json).encode()
+    elif body_changed:
+        raw_body = json.dumps(body_json).encode()
+
+    # ── Build upstream headers ────────────────────────────────────────────────
+    base_headers = _passthrough_headers(request)
+    base_headers["content-type"] = "application/json"
+
+    # Strip Anthropic-specific headers before forwarding to OpenAI-format endpoints.
+    if api_type == "openai":
+        base_headers = {
+            k: v for k, v in base_headers.items() if k.lower() not in _ANTHROPIC_ONLY_HEADERS
+        }
+
+    if auth == "none":
+        upstream_headers = base_headers
+        log.info("[model-router] %s -> LOCAL      url=%s  model=%s", model, target_url, upstream_model)
+
+    elif auth == "aws":
+        region = route.get("aws_region", "us-east-1")
+        if api_type == "openai":
+            # OpenAI-format Bedrock routes sign per-request via _SigV4Auth on the httpx client.
+            # Skip the eager _sign_bedrock call to avoid a NoCredentialsError crash (e.g. on
+            # expired SSO) before the openai.APIStatusError handler is even reached.
+            upstream_headers = base_headers
+        else:
+            # Anthropic-format Bedrock routes: pre-sign the headers here.
+            # Normalize to lowercase to avoid duplicate content-type.
+            try:
+                sig_headers = {k.lower(): v for k, v in _sign_bedrock(target_url, raw_body, route).items()}
+            except Exception as _cred_exc:
+                from botocore.exceptions import TokenRetrievalError
+                if isinstance(_cred_exc, TokenRetrievalError):
+                    _profile = os.environ.get("AWS_PROFILE", "<profile>")
+                    from fastapi.responses import JSONResponse
+                    return JSONResponse(
+                        {"type": "error", "error": {"type": "authentication_error", "message": f"AWS SSO token expired. Run: aws sso login --profile {_profile}"}},
+                        status_code=401,
+                    )
+                raise
+            upstream_headers = {**base_headers, **sig_headers}
+            upstream_headers["content-type"] = "application/json"
+            upstream_headers["anthropic-version"] = "2023-06-01"
+        log.info(
+            "[model-router] %s -> BEDROCK     region=%s  model=%s  api=%s",
+            model, region, upstream_model, api_type,
+        )
+
+    else:  # passthrough — forward client Authorization verbatim
+        upstream_headers = base_headers
+        if auth_val := request.headers.get("authorization"):
+            upstream_headers["authorization"] = auth_val
+        log.info("[model-router] %s -> PASSTHROUGH url=%s  model=%s", model, target_url, upstream_model)
+
+    # ── OpenAI route: use openai SDK (typed chunks, SigV4 via httpx.Auth) ─────
+    if api_type == "openai":
+        import openai
+        from fastapi.responses import JSONResponse, Response
+
+        # Strip /chat/completions suffix to get the base URL the SDK appends to.
+        base_url = target_url.removesuffix("/chat/completions")
+        _auth = _SigV4Auth(route) if auth == "aws" else None
+        http_client = httpx.AsyncClient(auth=_auth, timeout=None)
+        oai_client = openai.AsyncOpenAI(
+            api_key="dummy",   # SigV4 / no-auth routes don't need a real key
+            base_url=base_url,
+            http_client=http_client,
+        )
+
+        # body_json is already OpenAI-format (translated above); exclude `stream`
+        # since we control it explicitly via the SDK kwarg.
+        oai_kwargs = {k: v for k, v in body_json.items() if k != "stream"}
+        msg_id = _msg_id()
+        log.info("[model-router] openai request body: %s", json.dumps(oai_kwargs, default=str)[:2000])
+        streaming_started = False
+        try:
+            if is_streaming:
+                stream = await oai_client.chat.completions.create(**oai_kwargs, stream=True, stream_options={"include_usage": True})
+                streaming_started = True
+                return StreamingResponse(
+                    _oai_stream_with_cleanup(stream, msg_id, upstream_model, backend_label, http_client, price_per_mtok, tier),
+                    status_code=200,
+                    media_type="text/event-stream",
+                )
+            else:
+                resp = await oai_client.chat.completions.create(**oai_kwargs, stream=False)
+                ant_resp = _openai_to_anthropic_response(resp.model_dump(), msg_id, upstream_model)
+                usage = ant_resp.get("usage", {})
+                _record_tokens(upstream_model, usage.get("input_tokens", 0), usage.get("output_tokens", 0), price_per_mtok, backend_label, tier)
+                return JSONResponse(ant_resp)
+        except openai.APIStatusError as exc:
+            log.error(
+                "[model-router] upstream %d from %s: %s",
+                exc.status_code, target_url, exc.response.text,
+            )
+            return Response(
+                content=exc.response.content,
+                status_code=exc.status_code,
+                media_type="application/json",
+            )
+        except Exception as exc:
+            from botocore.exceptions import TokenRetrievalError
+            if isinstance(exc, TokenRetrievalError):
+                _profile = os.environ.get("AWS_PROFILE", "<profile>")
+                return JSONResponse(
+                    {"type": "error", "error": {"type": "authentication_error", "message": f"AWS SSO token expired. Run: aws sso login --profile {_profile}"}},
+                    status_code=401,
+                )
+            raise
+        finally:
+            # Streaming: the generator owns cleanup after the first chunk flows.
+            # Non-streaming and error paths: close here since we never yield a generator.
+            if not streaming_started:
+                await http_client.aclose()
+
+    # ── Anthropic / local route: open upstream connection and stream verbatim ─
+    client = httpx.AsyncClient(timeout=None)
+    try:
+        upstream_req = client.build_request(
+            "POST", target_url, headers=upstream_headers, content=raw_body
+        )
+        upstream_resp = await client.send(upstream_req, stream=True)
+    except Exception:
+        await client.aclose()
+        raise
+
+    # ── Log upstream errors so the root cause is visible in the router log ───
+    if upstream_resp.status_code >= 400:
+        error_body = await upstream_resp.aread()
+        await client.aclose()
+        log.error(
+            "[model-router] upstream %d from %s: %s",
+            upstream_resp.status_code,
+            target_url,
+            error_body[:1000].decode("utf-8", errors="replace"),
+        )
+        from fastapi.responses import Response
+
+        return Response(
+            content=error_body,
+            status_code=upstream_resp.status_code,
+            media_type=upstream_resp.headers.get("content-type", "application/json"),
+        )
+
+    # ── Anthropic route: strip hop-by-hop headers and stream verbatim ─────────
+    _HOP_BY_HOP = frozenset({"content-encoding", "transfer-encoding", "connection", "keep-alive"})
+    resp_headers = {
+        k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_BY_HOP
+    }
+
+    return StreamingResponse(
+        _stream_logging(upstream_resp, client, tool_name_map, backend_label, upstream_model, is_streaming, price_per_mtok, tier),
+        status_code=upstream_resp.status_code,
+        headers=resp_headers,
+        media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
+    )
+
+
+async def _oai_stream_with_cleanup(
+    stream,
+    msg_id: str,
+    upstream_model: str,
+    backend_label: str,
+    http_client: httpx.AsyncClient,
+    price_per_mtok: float = 0.0,
+    tier: str = "",
+) -> AsyncGenerator[bytes, None]:
+    """Wrap _stream_oai_sdk_to_anthropic and close the httpx client when the stream ends."""
+    try:
+        async for chunk in _stream_oai_sdk_to_anthropic(stream, msg_id, upstream_model, backend_label, price_per_mtok, tier):
+            yield chunk
+    finally:
+        await http_client.aclose()
+
+
+async def _stream_logging(
+    resp: httpx.Response,
+    client: httpx.AsyncClient,
+    tool_name_map: dict[str, str],
+    backend_label: str,
+    upstream_model: str,
+    is_streaming: bool,
+    price_per_mtok: float = 0.0,
+    tier: str = "",
+) -> AsyncGenerator[bytes, None]:
+    """Stream bytes, restore tool names, and log token usage at completion."""
+    input_tokens = 0
+    output_tokens = 0
+    partial_sse = ""
+    body_bytes = b""
+
+    try:
+        async for chunk in resp.aiter_bytes():
+            text: str | None = None
+            if tool_name_map:
+                text = chunk.decode("utf-8", errors="replace")
+                for sanitized, original in tool_name_map.items():
+                    text = text.replace(f'"name":"{sanitized}"', f'"name":"{original}"')
+                    text = text.replace(f'"name": "{sanitized}"', f'"name": "{original}"')
+                chunk = text.encode("utf-8")
+
+            if is_streaming:
+                partial_sse += text if text is not None else chunk.decode("utf-8", errors="replace")
+                while "\n\n" in partial_sse:
+                    event_text, partial_sse = partial_sse.split("\n\n", 1)
+                    for line in event_text.split("\n"):
+                        if line.startswith("data: "):
+                            try:
+                                ev = json.loads(line[6:])
+                                etype = ev.get("type")
+                                if etype == "message_start":
+                                    usage = ev.get("message", {}).get("usage", {})
+                                    input_tokens = usage.get("input_tokens", input_tokens)
+                                elif etype == "message_delta":
+                                    usage = ev.get("usage", {})
+                                    output_tokens = usage.get("output_tokens", output_tokens)
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+            else:
+                body_bytes += chunk
+
+            yield chunk
+    finally:
+        if not is_streaming:
+            try:
+                usage = json.loads(body_bytes).get("usage", {})
+                input_tokens = usage.get("input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        _record_tokens(upstream_model, input_tokens, output_tokens, price_per_mtok, backend_label, tier)
+        await resp.aclose()
+        await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("ROUTER_PORT", 8771))
+    log.info("[model-router] starting on 127.0.0.1:%d  (config: %s)", port, CONFIG_PATH)
+    for m, r in ROUTES.items():
+        log.info("  %-40s -> %-12s  url=%s", m, r["auth"], r["url"])
+    print(f"[model-router] listening on 127.0.0.1:{port}", flush=True)
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

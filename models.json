@@ -1,0 +1,159 @@
+{
+  "_comment": "Model catalog for install-model-router. Edit this file to add models, update context windows, or change defaults. Re-run install-model-router to apply changes.",
+
+  "local_models": [
+    {
+      "id":               "mlx-community/gemma-4-e4b-it-4bit",
+      "size_gb":          4.62,
+      "context_window":   131072,
+      "max_output_tokens": 65536,
+      "tool_parser":      null,
+      "price_per_mtok":   0,
+      "fit_32gb":         "✅",
+      "fit_16gb":         "✅",
+      "reason":           "Clean tool calling, 128K ctx"
+    },
+    {
+      "id":               "mlx-community/Qwen3-8B-4bit",
+      "size_gb":          4.62,
+      "context_window":   40960,
+      "max_output_tokens": 32768,
+      "tool_parser":      "qwen",
+      "price_per_mtok":   0,
+      "fit_32gb":         "✅",
+      "fit_16gb":         "✅",
+      "reason":           "★ 40K ctx, strong coder"
+    },
+    {
+      "id":               "mlx-community/Qwen3.5-9B-MLX-4bit",
+      "size_gb":          5.98,
+      "context_window":   262144,
+      "max_output_tokens": 131072,
+      "tool_parser":      "qwen",
+      "price_per_mtok":   0,
+      "fit_32gb":         "✅",
+      "fit_16gb":         "✅",
+      "reason":           "256K ctx; thinking token leak [1]"
+    },
+    {
+      "id":               "mlx-community/Qwen3-14B-4bit",
+      "size_gb":          8.32,
+      "context_window":   40960,
+      "max_output_tokens": 32768,
+      "tool_parser":      "qwen",
+      "price_per_mtok":   0,
+      "fit_32gb":         "✅",
+      "fit_16gb":         "⚠️",
+      "reason":           "Best coding on 16GB; thinking mode"
+    },
+    {
+      "id":               "mlx-community/gemma-4-12B-it-4bit",
+      "size_gb":          11.02,
+      "context_window":   262144,
+      "max_output_tokens": 131072,
+      "tool_parser":      null,
+      "price_per_mtok":   0,
+      "fit_32gb":         "✅",
+      "fit_16gb":         "❌",
+      "reason":           "72% LiveCodeBench, multimodal"
+    },
+    {
+      "id":               "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+      "size_gb":          18.0,
+      "context_window":   262144,
+      "max_output_tokens": 131072,
+      "tool_parser":      "qwen",
+      "price_per_mtok":   0,
+      "fit_32gb":         "⚠️",
+      "fit_16gb":         "❌",
+      "reason":           "Heavier coder; 24GB+ RAM"
+    },
+    {
+      "id":               "mlx-community/Qwen3.6-27B-4bit",
+      "size_gb":          16.08,
+      "context_window":   262144,
+      "max_output_tokens": 131072,
+      "tool_parser":      "qwen",
+      "price_per_mtok":   0,
+      "fit_32gb":         "⚠️",
+      "fit_16gb":         "❌",
+      "reason":           "77.2% SWE-bench — best coding here"
+    }
+  ],
+
+  "bedrock_models": [
+    {
+      "id":               "qwen.qwen3-coder-30b-a3b-v1:0",
+      "context_window":   262144,
+      "max_output_tokens": 32768,
+      "api_type":         "openai",
+      "price_per_mtok":   0.15,
+      "reason":           "Best Bedrock coding model (default)"
+    },
+    {
+      "id":               "qwen.qwen3-coder-next",
+      "context_window":   262144,
+      "max_output_tokens": 32768,
+      "api_type":         "openai",
+      "price_per_mtok":   0.50,
+      "reason":           "Next-gen Qwen Coder on Bedrock"
+    },
+    {
+      "id":               "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "context_window":   200000,
+      "max_output_tokens": null,
+      "api_type":         "anthropic",
+      "price_per_mtok":   3.0,
+      "reason":           "Claude Sonnet on Bedrock; familiar behavior"
+    },
+    {
+      "id":               "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "context_window":   200000,
+      "max_output_tokens": null,
+      "api_type":         "anthropic",
+      "price_per_mtok":   1.0,
+      "reason":           "Fast, cheap Claude on Bedrock"
+    }
+  ],
+
+  "anthropic_models": [
+    {"tier": "haiku",  "id": "claude-haiku-4-5-20251001", "max_output_tokens": null,  "price_per_mtok": 1.0},
+    {"tier": "sonnet", "id": "claude-sonnet-4-6",          "max_output_tokens": null,  "price_per_mtok": 3.0},
+    {"tier": "opus",   "id": "claude-opus-4-8",            "max_output_tokens": 32768, "price_per_mtok": 5.0},
+    {"tier": "fable",  "id": "claude-fable-5",             "max_output_tokens": 32768, "price_per_mtok": 10.0}
+  ],
+
+  "defaults": {
+    "tier_backends": {
+      "haiku":  {"backend": "local", "local_model": "mlx-community/Qwen3.5-9B-MLX-4bit"},
+      "sonnet": {"backend": "bedrock", "bedrock_model": "qwen.qwen3-coder-next"},
+      "opus":   {"backend": "claude"},
+      "fable":  {"backend": "claude"}
+    },
+
+    "ram_model_selection": [
+      {
+        "ram_min_gb": 48,
+        "model":      "mlx-community/Qwen3.6-27B-4bit",
+        "reason":     "≥48 GB: best coding; ~16 GB weights, leaves room for KV cache"
+      },
+      {
+        "ram_min_gb": 24,
+        "model":      "mlx-community/Qwen3-14B-4bit",
+        "reason":     "24–47 GB: strong reasoning; ~8 GB weights"
+      },
+      {
+        "ram_min_gb": 0,
+        "model":      "mlx-community/Qwen3.5-9B-MLX-4bit",
+        "reason":     "<24 GB: compact 256K model; ~6 GB weights"
+      }
+    ],
+
+    "ram_kv_cache_cap": [
+      {"ram_max_gb": 36,     "tokens": 32768,   "reason": "≤36 GB: ~16K live after 55% compact trigger"},
+      {"ram_max_gb": 64,     "tokens": 65536,   "reason": "37–64 GB"},
+      {"ram_max_gb": 128,    "tokens": 131072,  "reason": "65–128 GB"},
+      {"ram_max_gb": 999999, "tokens": 1048576, "reason": ">128 GB: effectively the model window"}
+    ]
+  }
+}
