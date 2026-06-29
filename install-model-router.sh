@@ -50,13 +50,50 @@ ENVF="$DIR/model-router.env"
 # When re-run from ~/model-router (via the alias), this is a no-op.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS_CONFIG="$SCRIPT_DIR/models.json"
+
+# GitHub repo for fetching additional files when run via curl
+GITHUB_REPO="imranq2/coding-model-router"
+GITHUB_BRANCH="main"
+
+# Self-bootstrap: when run from the skill's scripts/ bundle, copy the whole bundle into
+# ~/model-router so the start/stop/uninstall scripts + tag_logger live alongside this one.
+# When run via curl, fetch all files from GitHub.
 if [ "$SCRIPT_DIR" != "$DIR" ]; then
-  echo "[0/6] Copying script bundle to $DIR ..."
-  cp "$SCRIPT_DIR/"*.sh "$SCRIPT_DIR/router.py" "$SCRIPT_DIR/models.json" "$SCRIPT_DIR/mcp-local.json" "$DIR/"
-  # The .whl is tracked in git but guard against a shallow clone / manual extraction.
-  [ -f "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" ] && \
-    cp "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" "$DIR/"
-  chmod +x "$DIR"/*.sh
+  # Detect if we're running via curl (SCRIPT_DIR is /var/folders or /tmp)
+  if [[ "$SCRIPT_DIR" == "/var/folders"* || "$SCRIPT_DIR" == "/tmp"* || "$SCRIPT_DIR" == "/private/tmp"* ]]; then
+    echo "[0/6] Downloading script bundle from GitHub..."
+    mkdir -p "$DIR"
+
+    # Download each required file from GitHub
+    for file in install-model-router.sh start-model-router.sh stop-model-router.sh uninstall-model-router.sh router.py models.json mcp-local.json; do
+      echo "  Fetching $file..."
+      if ! curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/$file" -o "$DIR/$file"; then
+        echo "ERROR: Failed to download $file" >&2
+        exit 1
+      fi
+    done
+
+    # Download the wheel if available (GitHub releases or main branch)
+    if curl -sfI "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/vllm_mlx-0.4.0-py3-none-any.whl" | head -1 | grep -q "200"; then
+      curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/vllm_mlx-0.4.0-py3-none-any.whl" -o "$DIR/vllm_mlx-0.4.0-py3-none-any.whl"
+      echo "  Fetching vllm_mlx-0.4.0-py3-none-any.whl..."
+    else
+      # Wheel not available on GitHub, will fetch from PyPI during install
+      echo "  (vllm_mlx wheel not found on GitHub - will install from PyPI)"
+    fi
+
+    chmod +x "$DIR"/*.sh
+    # Update SCRIPT_DIR and MODELS_CONFIG to the new location
+    SCRIPT_DIR="$DIR"
+    MODELS_CONFIG="$DIR/models.json"
+  else
+    echo "[0/6] Copying script bundle to $DIR ..."
+    cp "$SCRIPT_DIR/"*.sh "$SCRIPT_DIR/router.py" "$SCRIPT_DIR/models.json" "$SCRIPT_DIR/mcp-local.json" "$DIR/"
+    # The .whl is tracked in git but guard against a shallow clone / manual extraction.
+    [ -f "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" ] && \
+      cp "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" "$DIR/"
+    chmod +x "$DIR"/*.sh
+  fi
 fi
 
 # Defaults (overridden by a prior install's env, then by flags).

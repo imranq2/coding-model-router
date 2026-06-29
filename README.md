@@ -2,6 +2,29 @@
 
 Local GPU-accelerated model routing for Claude Code on Apple Silicon Macs (M1/M2/M3/M4).
 
+## Prerequisites
+
+This project only works on Apple Silicon Macs (M1, M2, M3, or M4) with macOS.
+
+### Required Software
+
+- **Python 3.10-3.13** — The installer prefers Python 3.12, but will use any supported version (3.10, 3.11, 3.12, or 3.13)
+- **Homebrew** (recommended) — For installing Python if not already available: `brew install python@3.12`
+- **AWS CLI** (optional) — Only needed if using AWS Bedrock as a backend: `brew install awscli`
+
+### Hardware
+
+- **RAM**: At least 16GB required, 24GB+ recommended for larger models
+- **GPU**: Apple Silicon GPU (integrated in M1/M2/M3/M4)
+- **Storage**: ~15-30GB free space for model downloads (depending on selected model)
+
+### Network
+
+- Initial install requires internet access to download Python packages and models
+- Once installed, local models work offline; cloud backends (Anthropic/Bedrock) still require internet
+
+## What This Code Does
+
 ## What This Code Does
 
 This project provides a routing proxy that lets Claude Code use local GPU models for background/cheap tasks while keeping complex reasoning on cloud APIs (Anthropic or AWS Bedrock).
@@ -54,6 +77,16 @@ This project provides a routing proxy that lets Claude Code use local GPU models
 
 ## Installation
 
+### Option 1: Direct from GitHub (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imranq2/coding-model-router/main/install-model-router.sh | bash
+```
+
+The installer will automatically fetch all required files (router.py, models.json, etc.) from GitHub and set everything up in `~/model-router/`.
+
+### Option 2: Local
+
 ```bash
 cd /Users/imranqureshi/git/coding-model-router
 bash install-model-router.sh
@@ -79,7 +112,7 @@ The installer will:
 ## Files
 
 | File | Purpose |
-|------|---------|
+|---|---|
 | `install-model-router.sh` | Interactive installer script |
 | `start-model-router.sh` | Starts vllm-mlx + router.py |
 | `stop-model-router.sh` | Kills both server processes |
@@ -87,8 +120,5 @@ The installer will:
 | `router.py` | FastAPI proxy with Anthropic/OpenAI translation |
 | `models.json` | Model config (context windows, sizes, Bedrock IDs) |
 | `mcp-local.json` | MCP server configuration for local tools |
-| `vllm_mlx-0.4.0-py3-none-any.whl` | vllm-mlx wheel (bundled for offline install) |
+| `vllm_mlx-0.4.0-py3-none-any.whl` | vllm-mlx wheel (bundled for offline install, or fetched from PyPI) |
 
-## Original Location
-
-These scripts were originally in `plugins/software-developers/skills/install-model-router/scripts/` in the [bwell-ai-plugin-marketplace](https://github.com/icanbwell/bwell-ai-plugin-marketplace) repository.
