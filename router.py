@@ -1161,10 +1161,20 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                 "[model-router] upstream %d from %s: %s",
                 exc.status_code, target_url, exc.response.text,
             )
-            return Response(
-                content=exc.response.content,
-                status_code=exc.status_code,
-                media_type="application/json",
+            # Surface the upstream error as a visible assistant message so the user
+            # sees it in Claude Code instead of getting a silent empty response.
+            try:
+                err_body = exc.response.json()
+                err_msg = (
+                    err_body.get("error", {}).get("message")
+                    or err_body.get("message")
+                    or exc.message
+                )
+            except Exception:
+                err_msg = exc.message or str(exc)
+            return _error_as_assistant_message(
+                f"Bedrock error ({exc.status_code}): {err_msg}",
+                upstream_model, is_streaming,
             )
         except Exception as exc:
             from botocore.exceptions import TokenRetrievalError
