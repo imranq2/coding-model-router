@@ -435,10 +435,10 @@ prompt_model() {  # interactive picker. Echoes the chosen HF id on STDOUT; all U
     echo ""
     printf "Selection [%s]: " "$def_idx"
   } >&2
-  read -r choice || true
+  read -r choice </dev/tty || true
   [ -z "$choice" ] && choice="$def_idx"
   if [ "$choice" = "$custom_idx" ]; then
-    printf "Enter Hugging Face repo id: " >&2; read -r custom || true; echo "$custom"
+    printf "Enter Hugging Face repo id: " >&2; read -r custom </dev/tty || true; echo "$custom"
   elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
     echo "${ids[$((choice-1))]}"
   else
@@ -505,10 +505,10 @@ prompt_bedrock_model() {  # picker for a Bedrock id; $1 = tier label. Echoes id 
     printf "  %d) custom — enter any Bedrock model id / ARN\n" "$custom_idx"
     printf "Selection [1]: "
   } >&2
-  read -r choice || true
+  read -r choice </dev/tty || true
   [ -z "$choice" ] && choice=1
   if [ "$choice" = "$custom_idx" ]; then
-    printf "Enter Bedrock model id: " >&2; read -r custom || true; echo "$custom"
+    printf "Enter Bedrock model id: " >&2; read -r custom </dev/tty || true; echo "$custom"
   elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
     echo "${ids[$((choice-1))]}"
   else
@@ -546,11 +546,11 @@ prompt_tier_backend() {
       printf "  %d) Bedrock — custom id / ARN\n" "$custom_idx"
       printf "Selection [%s]: " "$def_idx"
     } >&2
-    read -r choice || true; [ -z "$choice" ] && choice="$def_idx"
+    read -r choice </dev/tty || true; [ -z "$choice" ] && choice="$def_idx"
     if   [ "$choice" = 1 ]; then set_tier_backend "$tier" claude
     elif [ "$choice" = 2 ]; then set_tier_backend "$tier" local
     elif [ "$choice" = "$custom_idx" ]; then
-      printf "Enter Bedrock model id: " >&2; read -r cid || true
+      printf "Enter Bedrock model id: " >&2; read -r cid </dev/tty || true
       if [ -n "$cid" ]; then set_tier_backend "$tier" "bedrock=$cid"; else set_tier_backend "$tier" claude; fi
     elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 3 ] && [ "$choice" -le "$(( 2 + n ))" ]; then
       set_tier_backend "$tier" "bedrock=${bids[$(( choice - 3 ))]}"
@@ -574,10 +574,10 @@ prompt_tier_backend() {
       printf "  %d) Bedrock — custom id / ARN\n" "$custom_idx"
       printf "Selection [%s]: " "$def_idx"
     } >&2
-    read -r choice || true; [ -z "$choice" ] && choice="$def_idx"
+    read -r choice </dev/tty || true; [ -z "$choice" ] && choice="$def_idx"
     if   [ "$choice" = 1 ]; then set_tier_backend "$tier" claude
     elif [ "$choice" = "$custom_idx" ]; then
-      printf "Enter Bedrock model id: " >&2; read -r cid || true
+      printf "Enter Bedrock model id: " >&2; read -r cid </dev/tty || true
       if [ -n "$cid" ]; then set_tier_backend "$tier" "bedrock=$cid"; else set_tier_backend "$tier" claude; fi
     elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 2 ] && [ "$choice" -le "$(( 1 + n ))" ]; then
       set_tier_backend "$tier" "bedrock=${bids[$(( choice - 2 ))]}"
@@ -622,11 +622,11 @@ prompt_max_tokens() {  # interactive picker for mlx-lm --max-tokens. Echoes chos
     printf "  %d) custom — enter any value\n" "$custom_idx"
     printf "Selection [%d]: " "$def_idx"
   } >&2
-  read -r choice || true; [ -z "$choice" ] && choice="$def_idx"
+  read -r choice </dev/tty || true; [ -z "$choice" ] && choice="$def_idx"
   if [ "$choice" = "$none_idx" ]; then
     echo "none"
   elif [ "$choice" = "$custom_idx" ]; then
-    printf "Enter max output tokens: " >&2; read -r custom || true; echo "${custom:-$current}"
+    printf "Enter max output tokens: " >&2; read -r custom </dev/tty || true; echo "${custom:-$current}"
   elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
     echo "${vals[$((choice-1))]}"
   else
@@ -654,9 +654,9 @@ prompt_autocompact_pct() {  # interactive picker for AUTOCOMPACT_PCT. Echoes cho
     printf "  %d) custom — enter 1–100\n" "$custom_idx"
     printf "Selection [%d]: " "$def_idx"
   } >&2
-  read -r choice || true; [ -z "$choice" ] && choice="$def_idx"
+  read -r choice </dev/tty || true; [ -z "$choice" ] && choice="$def_idx"
   if [ "$choice" = "$custom_idx" ]; then
-    printf "Enter percentage (1–100): " >&2; read -r custom || true; echo "${custom:-$current}"
+    printf "Enter percentage (1–100): " >&2; read -r custom </dev/tty || true; echo "${custom:-$current}"
   elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
     echo "${vals[$((choice-1))]}"
   else
@@ -672,7 +672,7 @@ prompt_autocompact_enabled() {  # yes/no prompt for auto-compact. Echoes 1 (on) 
     echo "(recommended for Bedrock/local models; press Enter to keep current: ${def_label})"
     printf "Enable auto-compact? [y/N]: "
   } >&2
-  read -r choice || true
+  read -r choice </dev/tty || true
   case "${choice:-$def_label}" in
     [Nn]*) echo 0 ;;
     *)     echo 1 ;;
@@ -695,9 +695,9 @@ prompt_prompt_cache() {  # interactive picker for --prompt-cache-bytes. Echoes c
     printf "  %d) custom — enter bytes (e.g. 6GB)\n" "$custom_idx"
     printf "Selection [%d]: " "$def_idx"
   } >&2
-  read -r choice || true; [ -z "$choice" ] && choice="$def_idx"
+  read -r choice </dev/tty || true; [ -z "$choice" ] && choice="$def_idx"
   if [ "$choice" = "$custom_idx" ]; then
-    printf "Enter size (e.g. 4294967296 or 4GB): " >&2; read -r custom || true
+    printf "Enter size (e.g. 4294967296 or 4GB): " >&2; read -r custom </dev/tty || true
     # Accept NGB shorthand
     case "${custom:-}" in
       *[Gg][Bb]) echo "$(( ${custom%[Gg][Bb]} * 1073741824 ))" ;;
@@ -727,9 +727,9 @@ _ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
 diag "system RAM: ${_ram_gb}GB"
 
 # Ask whether to use local models (vllm-mlx). Only prompt on a TTY when not already saved.
-if [ -t 0 ] && [ -z "${USE_LOCAL_MODELS:-}" ]; then
+if [ -t 1 ] && [ -z "${USE_LOCAL_MODELS:-}" ]; then
   printf "\nUse local models (vllm-mlx, requires GPU + model download)? [Y/n]: " >&2
-  read -r _ulm || true
+  read -r _ulm </dev/tty || true
   case "${_ulm:-y}" in
     [Nn]*) USE_LOCAL_MODELS=0 ;;
     *)     USE_LOCAL_MODELS=1 ;;
@@ -744,7 +744,7 @@ USE_LOCAL_MODELS="${USE_LOCAL_MODELS:-1}"
 if [ "${USE_LOCAL_MODELS}" = "1" ]; then
   if [ -n "$MODEL_EXPLICIT" ]; then
     :
-  elif [ -t 0 ]; then
+  elif [ -t 1 ]; then
     [ -n "$MODEL_ID" ] || MODEL_ID="${DEFAULT_LOCAL_MODEL:-$(detect_model)}"
     MODEL_ID="$(prompt_model "$MODEL_ID")"
   else
@@ -759,7 +759,7 @@ if [ "$MODE" = "B" ] && [ -z "$ANTHROPIC_KEY" ]; then ANTHROPIC_KEY="${ANTHROPIC
 [ -z "$MLX_MAX_TOKENS" ] && MLX_MAX_TOKENS="none"
 if [ "${USE_LOCAL_MODELS}" = "1" ]; then
   _model_ctx_tokens="$(model_ctx "$MODEL_ID")"
-  if [ -t 0 ]; then
+  if [ -t 1 ]; then
     [ -z "$MAXTOK_EXPLICIT" ]             && MLX_MAX_TOKENS="$(prompt_max_tokens "$MLX_MAX_TOKENS" "${_model_ctx_tokens:-0}")"
     [ -z "$AUTOCOMPACT_ENABLED_EXPLICIT" ] && AUTOCOMPACT_ENABLED="$(prompt_autocompact_enabled "$AUTOCOMPACT_ENABLED")"
     [ "$AUTOCOMPACT_ENABLED" = "1" ] && [ -z "$AUTOCOMPACT_EXPLICIT" ] && AUTOCOMPACT_PCT="$(prompt_autocompact_pct "$AUTOCOMPACT_PCT")"
@@ -815,7 +815,7 @@ FABLE_BACKEND="${FABLE_BACKEND:-${DEFAULT_BACKEND_FABLE:-claude}}"
 # Interactive per-tier menu: when on a terminal and no tier flags were passed, walk the user
 # through choosing a backend (Claude default / local model / Bedrock) for each complexity tier,
 # defaulting to the current/just-resolved value. Skipped non-interactively or when flags set tiers.
-if [ -t 0 ] && [ -z "$TIERS_EXPLICIT" ]; then
+if [ -t 1 ] && [ -z "$TIERS_EXPLICIT" ]; then
   prompt_tier_backend low     haiku
   prompt_tier_backend medium  sonnet
   prompt_tier_backend high    opus
@@ -853,7 +853,7 @@ fi
 # otherwise (skill/launchd) error rather than guess.
 for _t in haiku sonnet opus fable; do
   if [ "$(tier_backend "$_t")" = "bedrock" ] && [ -z "$(tier_bedrock "$_t")" ]; then
-    if [ -t 0 ]; then
+    if [ -t 1 ]; then
       _bid="$(prompt_bedrock_model "$_t")"
       [ -n "$_bid" ] || { echo "ERROR: no Bedrock model chosen for the $_t tier." >&2; exit 2; }
       set_tier_backend "$_t" "bedrock=$_bid"
