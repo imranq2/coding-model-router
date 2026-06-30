@@ -1094,20 +1094,10 @@ $BEGIN
 # execution (normal coding); Haiku still handles background tasks. Override per run
 # with 'claude-router --model sonnet' or /model.
 claude-router() {
-  echo "[model-router] proxy=localhost:$ROUTER_PORT  compact=$_compactnote" >&2
+  echo "[model-router] proxy=localhost:$ROUTER_PORT" >&2
   env -u ANTHROPIC_API_KEY \\
     ANTHROPIC_BASE_URL="http://localhost:$ROUTER_PORT" \\
     ANTHROPIC_MODEL="opusplan" \\
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$TIER_MODEL_HAIKU" \\
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$TIER_MODEL_SONNET" \\
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$TIER_MODEL_OPUS" \\
-    ANTHROPIC_DEFAULT_FABLE_MODEL="$TIER_MODEL_FABLE" \\
-    CLAUDE_CODE_ATTRIBUTION_HEADER="0" \\
-    DISABLE_PROMPT_CACHING="1" \\
-    DISABLE_AUTOUPDATER="1" \\
-    DISABLE_TELEMETRY="1" \\
-    DISABLE_ERROR_REPORTING="1" \\
-    DISABLE_NON_ESSENTIAL_MODEL_CALLS="1" \\
     claude \\
       "\$@"
 }
@@ -1126,20 +1116,10 @@ $BEGIN
 # execution (normal coding); Haiku still handles background tasks. Override per run
 # with 'claude-router --model sonnet' or /model.
 claude-router() {
-  echo "[model-router] proxy=localhost:$ROUTER_PORT  compact=$_compactnote" >&2
+  echo "[model-router] proxy=localhost:$ROUTER_PORT" >&2
   ANTHROPIC_BASE_URL="http://localhost:$ROUTER_PORT" \\
     ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \\
     ANTHROPIC_MODEL="opusplan" \\
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$TIER_MODEL_HAIKU" \\
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$TIER_MODEL_SONNET" \\
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$TIER_MODEL_OPUS" \\
-    ANTHROPIC_DEFAULT_FABLE_MODEL="$TIER_MODEL_FABLE" \\
-    CLAUDE_CODE_ATTRIBUTION_HEADER="0" \\
-    DISABLE_PROMPT_CACHING="1" \\
-    DISABLE_AUTOUPDATER="1" \\
-    DISABLE_TELEMETRY="1" \\
-    DISABLE_ERROR_REPORTING="1" \\
-    DISABLE_NON_ESSENTIAL_MODEL_CALLS="1" \\
     claude \\
       "\$@"
 }
