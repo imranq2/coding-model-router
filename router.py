@@ -437,6 +437,53 @@ def _sse_event(event_type: str, data: dict) -> bytes:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
 
 
+def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
+    """Return the error text as a valid Anthropic assistant message (status 200).
+
+    Claude Code only shows text to the user when it receives a valid 200 response.
+    HTTP 4xx/5xx are surfaced as opaque API errors with no actionable message.
+    """
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    msg_id = _msg_id()
+    if not is_streaming:
+        return JSONResponse({
+            "id": msg_id, "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": model, "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": len(text.split())},
+        })
+
+    async def _stream():
+        yield _sse_event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id, "type": "message", "role": "assistant",
+                "content": [], "model": model,
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+        yield _sse_event("ping", {"type": "ping"})
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        })
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+        yield _sse_event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": len(text.split())},
+        })
+        yield _sse_event("message_stop", {"type": "message_stop"})
+
+    return StreamingResponse(_stream(), status_code=200, media_type="text/event-stream")
+
+
 def _anthropic_content_to_text(content) -> str:
     """Flatten Anthropic content (str or list of blocks) to a plain string."""
     if isinstance(content, str):
@@ -929,11 +976,8 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                 from botocore.exceptions import TokenRetrievalError
                 if isinstance(_cred_exc, TokenRetrievalError):
                     _profile = os.environ.get("AWS_PROFILE", "<profile>")
-                    from fastapi.responses import JSONResponse
-                    return JSONResponse(
-                        {"type": "error", "error": {"type": "authentication_error", "message": f"AWS SSO token expired. Run: aws sso login --profile {_profile}"}},
-                        status_code=401,
-                    )
+                    _msg = f"Your AWS Bedrock session has expired. Run: aws sso login --profile {_profile}"
+                    return _error_as_assistant_message(_msg, upstream_model, is_streaming)
                 raise
             upstream_headers = {**base_headers, **sig_headers}
             upstream_headers["content-type"] = "application/json"
@@ -997,12 +1041,11 @@ async def proxy_messages(request: Request) -> StreamingResponse:
             )
         except Exception as exc:
             from botocore.exceptions import TokenRetrievalError
-            if isinstance(exc, TokenRetrievalError):
+            _cause = exc.__cause__ or exc.__context__
+            if isinstance(exc, TokenRetrievalError) or isinstance(_cause, TokenRetrievalError):
                 _profile = os.environ.get("AWS_PROFILE", "<profile>")
-                return JSONResponse(
-                    {"type": "error", "error": {"type": "authentication_error", "message": f"AWS SSO token expired. Run: aws sso login --profile {_profile}"}},
-                    status_code=401,
-                )
+                _msg = f"Your AWS Bedrock session has expired. Run: aws sso login --profile {_profile}"
+                return _error_as_assistant_message(_msg, upstream_model, is_streaming)
             raise
         finally:
             # Streaming: the generator owns cleanup after the first chunk flows.

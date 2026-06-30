@@ -1079,15 +1079,6 @@ echo "[5/6] Ensuring bundle scripts are executable..."
 chmod +x "$DIR"/*.sh 2>/dev/null || true
 
 echo "[6/6] Adding claude-router + aliases to ~/.zshrc (idempotent)..."
-# Pre-build the optional compact env vars for the alias. Variable substitution in a heredoc
-# is literal (no further \\ processing), so single backslashes here produce single backslashes
-# in the output file. The trailing newline separates the last compact line from "claude $@".
-_acw_block=""
-if [ "$AUTOCOMPACT_ENABLED" = "1" ]; then
-  _acw_block="    CLAUDE_CODE_AUTO_COMPACT_WINDOW=\"${ACW}\" \\
-    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=\"${AUTOCOMPACT_PCT}\" \\
-"
-fi
 # Remove any prior block first so re-runs don't stack duplicates.
 awk 'BEGIN{skip=0}
      /# >>> claude model routing >>>/{skip=1}
@@ -1103,24 +1094,11 @@ $BEGIN
 # execution (normal coding); Haiku still handles background tasks. Override per run
 # with 'claude-router --model sonnet' or /model.
 claude-router() {
-  echo "[model-router] proxy=localhost:$ROUTER_PORT  compact=$_compactnote" >&2
+  echo "[model-router] proxy=localhost:$ROUTER_PORT" >&2
   env -u ANTHROPIC_API_KEY \\
     ANTHROPIC_BASE_URL="http://localhost:$ROUTER_PORT" \\
     ANTHROPIC_MODEL="opusplan" \\
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$TIER_MODEL_HAIKU" \\
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$TIER_MODEL_SONNET" \\
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$TIER_MODEL_OPUS" \\
-    ANTHROPIC_DEFAULT_FABLE_MODEL="$TIER_MODEL_FABLE" \\
-    CLAUDE_CODE_ATTRIBUTION_HEADER="0" \\
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS="8192" \\
-    DISABLE_PROMPT_CACHING="1" \\
-    DISABLE_AUTOUPDATER="1" \\
-    DISABLE_TELEMETRY="1" \\
-    DISABLE_ERROR_REPORTING="1" \\
-    DISABLE_NON_ESSENTIAL_MODEL_CALLS="1" \\
-${_acw_block}    claude --strict-mcp-config --mcp-config "\$HOME/model-router/mcp-local.json" \\
-      --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch" \\
-      --exclude-dynamic-system-prompt-sections \\
+    claude \\
       "\$@"
 }
 alias install-model-router="bash \$HOME/model-router/install-model-router.sh"
@@ -1138,24 +1116,11 @@ $BEGIN
 # execution (normal coding); Haiku still handles background tasks. Override per run
 # with 'claude-router --model sonnet' or /model.
 claude-router() {
-  echo "[model-router] proxy=localhost:$ROUTER_PORT  compact=$_compactnote" >&2
+  echo "[model-router] proxy=localhost:$ROUTER_PORT" >&2
   ANTHROPIC_BASE_URL="http://localhost:$ROUTER_PORT" \\
     ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \\
     ANTHROPIC_MODEL="opusplan" \\
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$TIER_MODEL_HAIKU" \\
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$TIER_MODEL_SONNET" \\
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$TIER_MODEL_OPUS" \\
-    ANTHROPIC_DEFAULT_FABLE_MODEL="$TIER_MODEL_FABLE" \\
-    CLAUDE_CODE_ATTRIBUTION_HEADER="0" \\
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS="8192" \\
-    DISABLE_PROMPT_CACHING="1" \\
-    DISABLE_AUTOUPDATER="1" \\
-    DISABLE_TELEMETRY="1" \\
-    DISABLE_ERROR_REPORTING="1" \\
-    DISABLE_NON_ESSENTIAL_MODEL_CALLS="1" \\
-${_acw_block}    claude --strict-mcp-config --mcp-config "\$HOME/model-router/mcp-local.json" \\
-      --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch" \\
-      --exclude-dynamic-system-prompt-sections \\
+    claude \\
       "\$@"
 }
 alias install-model-router="bash \$HOME/model-router/install-model-router.sh"
