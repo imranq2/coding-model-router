@@ -495,8 +495,7 @@ def _estimate_input_tokens(body_json: dict) -> int:
     """Estimate input token count from Anthropic request body using character-based heuristic.
 
     Uses the standard heuristic: ~4 characters ≈ 1 token for English text.
-    This is accurate enough for context window management (we only need
-    approximate counts to avoid exceeding limits).
+    Counts all content: system, messages (text + tool_use + tool_result), and tool definitions.
     """
     total_chars = 0
 
@@ -504,20 +503,39 @@ def _estimate_input_tokens(body_json: dict) -> int:
     if system := body_json.get("system"):
         total_chars += len(_anthropic_content_to_text(system))
 
-    # Count messages (user and assistant)
+    # Count all message content (text, tool_use, and tool_result blocks)
     for msg in body_json.get("messages", []):
         content = msg.get("content", "")
         if isinstance(content, str):
             total_chars += len(content)
         elif isinstance(content, list):
             for block in content:
-                if block.get("type") == "text":
+                btype = block.get("type")
+                if btype == "text":
                     total_chars += len(block.get("text", ""))
-                # Tool results are part of input but we don't count them separately
-                # as they're nested in message content
+                elif btype == "tool_use":
+                    total_chars += len(block.get("name", ""))
+                    inp = block.get("input")
+                    if inp:
+                        total_chars += len(json.dumps(inp))
+                elif btype == "tool_result":
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, str):
+                        total_chars += len(result_content)
+                    elif isinstance(result_content, list):
+                        for rb in result_content:
+                            if rb.get("type") == "text":
+                                total_chars += len(rb.get("text", ""))
 
-    # Convert characters to tokens (4 chars ≈ 1 token)
-    # Round up to be conservative
+    # Count tool definitions (name + description + input_schema)
+    for tool in body_json.get("tools", []):
+        total_chars += len(tool.get("name", ""))
+        total_chars += len(tool.get("description", ""))
+        schema = tool.get("input_schema") or tool.get("parameters") or {}
+        if schema:
+            total_chars += len(json.dumps(schema))
+
+    # Convert characters to tokens (4 chars ≈ 1 token), round up to be conservative
     return (total_chars + 3) // 4
 
 
@@ -692,6 +710,7 @@ async def _stream_oai_sdk_to_anthropic(
     backend_label: str = "BEDROCK",
     price_per_mtok: float = 0.0,
     tier: str = "",
+    first_chunk=None,  # pre-fetched chunk from peek-before-commit retry logic
 ) -> AsyncGenerator[bytes, None]:
     """Convert an openai SDK async stream to Anthropic SSE format.
 
@@ -708,8 +727,14 @@ async def _stream_oai_sdk_to_anthropic(
     output_tokens = 0
     thinking_stripper = _ThinkingStripper()
 
-    try:
+    async def _iter_stream():
+        if first_chunk is not None:
+            yield first_chunk
         async for chunk in stream:
+            yield chunk
+
+    try:
+        async for chunk in _iter_stream():
             if not sent_message_start:
                 sent_message_start = True
                 yield _sse_event("message_start", {
@@ -784,9 +809,10 @@ async def _stream_oai_sdk_to_anthropic(
                     output_tokens = chunk.usage.completion_tokens
 
     except Exception as _exc:
-        # Log mid-stream errors but continue to emit the SSE termination events so Claude Code's
-        # parser doesn't hang indefinitely waiting for message_stop.
         log.error("[model-router] upstream stream error: %s", _exc)
+        _stream_error_msg = str(_exc)
+    else:
+        _stream_error_msg = None
     finally:
         await stream.close()
 
@@ -808,6 +834,19 @@ async def _stream_oai_sdk_to_anthropic(
             },
         })
         yield _sse_event("ping", {"type": "ping"})
+
+    # When the stream errored before producing any content, emit a visible error text block
+    # so the user knows what happened instead of receiving a silent empty response.
+    if _stream_error_msg and not sent_message_start:
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": f"[model-router error] {_stream_error_msg}"},
+        })
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
     # Flush any text the stripper held back waiting for a possible </think> continuation.
     remaining = thinking_stripper.flush()
@@ -1073,12 +1112,41 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         msg_id = _msg_id()
         log.info("[model-router] openai request body: %s", json.dumps(oai_kwargs, default=str)[:2000])
         streaming_started = False
+        _CONTEXT_OVERFLOW_RE = re.compile(r"contains at least (\d+) input tokens")
         try:
             if is_streaming:
-                stream = await oai_client.chat.completions.create(**oai_kwargs, stream=True, stream_options={"include_usage": True})
+                # Peek at the first chunk before committing to StreamingResponse so we can
+                # detect context-overflow 400s (Bedrock sends HTTP 200 + error event in stream).
+                # Bedrock's error reports "input = context_window + 1 - max_tokens" (a formula,
+                # not the true count), so we can't compute the exact fix — instead we halve
+                # max_tokens on each attempt until it succeeds or we exhaust retries.
+                _MAX_OVERFLOW_RETRIES = 4
+                first_chunk = None
+                _original_max = oai_kwargs.get("max_tokens", route_context_window or 32768)
+                for _attempt in range(_MAX_OVERFLOW_RETRIES + 1):
+                    if _attempt > 0:
+                        await http_client.aclose()
+                        http_client = httpx.AsyncClient(auth=_auth, timeout=None)
+                        oai_client = openai.AsyncOpenAI(api_key="dummy", base_url=base_url, http_client=http_client)
+                    stream = await oai_client.chat.completions.create(**oai_kwargs, stream=True, stream_options={"include_usage": True})
+                    try:
+                        first_chunk = await stream.__anext__()
+                        break  # success — proceed with this stream
+                    except Exception as peek_exc:
+                        await stream.close()
+                        if _CONTEXT_OVERFLOW_RE.search(str(peek_exc)) and _attempt < _MAX_OVERFLOW_RETRIES:
+                            # Halve max_tokens on each attempt: 32768 → 16384 → 8192 → 4096 → 2048
+                            oai_kwargs["max_tokens"] = max(1, _original_max >> (_attempt + 1))
+                            log.warning(
+                                "[model-router] context overflow (attempt %d/%d): reducing max_tokens %d → %d",
+                                _attempt + 1, _MAX_OVERFLOW_RETRIES,
+                                _original_max >> _attempt, oai_kwargs["max_tokens"],
+                            )
+                        else:
+                            raise
                 streaming_started = True
                 return StreamingResponse(
-                    _oai_stream_with_cleanup(stream, msg_id, upstream_model, backend_label, http_client, price_per_mtok, tier),
+                    _oai_stream_with_cleanup(stream, msg_id, upstream_model, backend_label, http_client, price_per_mtok, tier, first_chunk=first_chunk),
                     status_code=200,
                     media_type="text/event-stream",
                 )
@@ -1163,10 +1231,11 @@ async def _oai_stream_with_cleanup(
     http_client: httpx.AsyncClient,
     price_per_mtok: float = 0.0,
     tier: str = "",
+    first_chunk=None,
 ) -> AsyncGenerator[bytes, None]:
     """Wrap _stream_oai_sdk_to_anthropic and close the httpx client when the stream ends."""
     try:
-        async for chunk in _stream_oai_sdk_to_anthropic(stream, msg_id, upstream_model, backend_label, price_per_mtok, tier):
+        async for chunk in _stream_oai_sdk_to_anthropic(stream, msg_id, upstream_model, backend_label, price_per_mtok, tier, first_chunk=first_chunk):
             yield chunk
     finally:
         await http_client.aclose()
