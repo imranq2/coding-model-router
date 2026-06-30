@@ -1020,9 +1020,18 @@ build_route() {
     # the route so the router overrides Claude Code's conservative 8K cap. Claude Bedrock models
     # have their own (lower) output ceiling and don't need the override.
     local _bprice; _bprice="$(bedrock_model_price "$bid")"
+    local _bctx; _bctx="$(bedrock_model_ctx "$bid")"
+    local _bmaxout; _bmaxout="$(bedrock_model_max_output "$bid")"
+    # For Qwen models, include context_window for dynamic token calculation
+    # and max_tokens to override Claude Code's conservative 8K cap
     if printf '%s' "$bid" | grep -qi '^qwen'; then
-      printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s}' \
-        "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice"
+      if [ -n "$_bctx" ]; then
+        printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s, "context_window": %s, "max_tokens": %s}' \
+          "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_bctx" "$_bmaxout"
+      else
+        printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s, "max_tokens": %s}' \
+          "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_bmaxout"
+      fi
     else
       printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/anthropic/v1/messages", "model": "%s", "auth": "aws", "aws_region": "%s", "price_per_mtok": %s}' \
         "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice"

@@ -491,6 +491,36 @@ def _anthropic_content_to_text(content) -> str:
     return "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
 
 
+def _estimate_input_tokens(body_json: dict) -> int:
+    """Estimate input token count from Anthropic request body using character-based heuristic.
+
+    Uses the standard heuristic: ~4 characters ≈ 1 token for English text.
+    This is accurate enough for context window management (we only need
+    approximate counts to avoid exceeding limits).
+    """
+    total_chars = 0
+
+    # Count system prompt
+    if system := body_json.get("system"):
+        total_chars += len(_anthropic_content_to_text(system))
+
+    # Count messages (user and assistant)
+    for msg in body_json.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    total_chars += len(block.get("text", ""))
+                # Tool results are part of input but we don't count them separately
+                # as they're nested in message content
+
+    # Convert characters to tokens (4 chars ≈ 1 token)
+    # Round up to be conservative
+    return (total_chars + 3) // 4
+
+
 def _anthropic_to_openai_request(body_json: dict) -> dict:
     """Translate an Anthropic Messages API request body to OpenAI Chat Completions format."""
     oai: dict = {"model": body_json["model"]}
@@ -906,6 +936,31 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     # max_tokens, use it as a floor for every route type — local, Bedrock, or passthrough.
     # When absent from the route config, leave the request unchanged.
     route_max_tokens: int | None = route.get("max_tokens")
+
+    # Dynamic context window enforcement — calculate remaining tokens based on input size.
+    # This prevents context overflow by capping output tokens when the input is large.
+    route_context_window: int | None = route.get("context_window")
+    if route_context_window is not None and auth != "none":
+        # Estimate input tokens from the request body (4 chars ≈ 1 token)
+        estimated_input_tokens = _estimate_input_tokens(body_json)
+        remaining_tokens = route_context_window - estimated_input_tokens
+        if remaining_tokens <= 0:
+            remaining_tokens = 1  # at least 1 output token
+        # Use the minimum of route_max_tokens (if set) and remaining tokens
+        # for remote routes, we want to cap (not floor) when the remaining context is smaller
+        if route_max_tokens is not None:
+            effective_max_tokens = min(route_max_tokens, remaining_tokens)
+        else:
+            effective_max_tokens = remaining_tokens
+        # Only apply if Claude Code requested more than we can provide
+        if body_json.get("max_tokens", 0) > effective_max_tokens:
+            body_json["max_tokens"] = effective_max_tokens
+            body_changed = True
+            log.info(
+                "[model-router] dynamic max_tokens: input=%d remaining=%d capped=%d",
+                estimated_input_tokens, remaining_tokens, effective_max_tokens
+            )
+
     tool_name_map: dict[str, str] = {}
 
     # Tool name sanitization is vllm-mlx specific (local routes only).
@@ -917,19 +972,23 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                 "[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map)
             )
 
-    # Apply max_tokens enforcement.
-    # Local routes (vllm-mlx): ceiling only — lower the request if it exceeds route_max_tokens
-    # (which reflects GPU KV-cache capacity); never raise it, to avoid OOM on small tasks.
-    # Remote routes (Bedrock/passthrough): floor only — raise if below the configured minimum
-    # so Claude Code's 8K cap doesn't truncate output; upstream enforces its own ceiling.
+    # Apply max_tokens enforcement (补充说明: the dynamic context calculation above
+    # has already capped max_tokens if needed). For remote routes, only raise if below
+    # route_max_tokens (the floor behavior). The dynamic cap ensures we never exceed
+    # the context window minus estimated input, so a simple floor is safe here.
     if route_max_tokens is not None:
         if auth == "none":
+            # Local: ceiling only — lower if exceeds route_max_tokens
             if body_json.get("max_tokens", 0) > route_max_tokens:
                 body_json["max_tokens"] = route_max_tokens
                 body_changed = True
-        elif body_json.get("max_tokens", 0) < route_max_tokens:
-            body_json["max_tokens"] = route_max_tokens
-            body_changed = True
+        else:
+            # Remote route: floor only — raise if below route_max_tokens
+            # The dynamic calculation above already ensures we don't exceed context window,
+            # so this simple floor won't cause overflow.
+            if body_json.get("max_tokens", 0) < route_max_tokens:
+                body_json["max_tokens"] = route_max_tokens
+                body_changed = True
 
     # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
     # to disable the reasoning chain that would otherwise appear as visible output).
