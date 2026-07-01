@@ -284,12 +284,35 @@ class _SigV4Auth(httpx.Auth):
 # context-overflow retry loop above, which handles a different, non-transient
 # error.
 
+# Bedrock dispatch rate gate — prevents on-demand capacity 503s at the source.
+# Bedrock's autoscaler rejects traffic that ramps faster than ~2x per 30 min,
+# so bursts (e.g. parallel tool calls after an idle period) trigger 503s.
+# Enforcing a minimum gap between consecutive dispatches smooths these bursts
+# without blocking concurrent in-flight streams (lock released immediately
+# after the timestamp update, before the actual HTTP send).
+_BEDROCK_MIN_DISPATCH_INTERVAL_S = 0.3  # ≤ ~3 new Bedrock dispatches/sec
+_bedrock_dispatch_lock = asyncio.Lock()
+_bedrock_last_dispatch: float = 0.0  # asyncio monotonic time of last dispatch
+
+
+async def _pace_bedrock_dispatch() -> None:
+    global _bedrock_last_dispatch
+    async with _bedrock_dispatch_lock:
+        loop = asyncio.get_running_loop()
+        wait = _BEDROCK_MIN_DISPATCH_INTERVAL_S - (loop.time() - _bedrock_last_dispatch)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _bedrock_last_dispatch = asyncio.get_running_loop().time()
+
+
 _MAX_THROTTLE_RETRIES = 5
 _THROTTLE_BASE_DELAY_S = 1.0
 _THROTTLE_MAX_DELAY_S = 20.0
 
 _THROTTLE_TEXT_RE = re.compile(
-    r"throttl|too many requests|rate.?limit|try again later|increase.*traffic|traffic.*increase",
+    r"throttl|too many requests|rate.?limit|try again later"
+    r"|increase.*traffic|traffic.*increase"
+    r"|on.?demand.capacity|exceed.*capacity|double faster",
     re.IGNORECASE,
 )
 
@@ -325,6 +348,8 @@ async def _send_with_bedrock_retry(
     """
     attempt = 0
     while True:
+        if auth == "aws":
+            await _pace_bedrock_dispatch()
         upstream_req = client.build_request(
             "POST", target_url, headers=upstream_headers, content=raw_body
         )

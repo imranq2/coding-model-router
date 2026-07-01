@@ -36,11 +36,18 @@ if [ "${USE_LOCAL_MODELS:-1}" = "1" ]; then
 
   # VLLM_MLX_ENABLE_THINKING=false strips <think> token leaks from Qwen3-class models.
   # --kv-cache-quantization halves KV cache footprint (more headroom before OOM).
-  # --cache-memory-mb caps the cross-request KV reuse cache (vllm-mlx flag name).
+  # --stream-interval 4: batch 4 tokens per SSE chunk (fewer Python wakeups, better GPU throughput).
+  # --timeout 600: raise from the 300s default to avoid disconnects on long generations.
+  # Cache: use explicit --cache-memory-mb if PROMPT_CACHE_BYTES is set, otherwise default to
+  # --cache-memory-percent 0.35 (35% of unified RAM, up from the 20% vllm-mlx default).
   MAX_TOK_ARGS=()
   [ -n "${MLX_MAX_TOKENS:-}" ] && [ "${MLX_MAX_TOKENS}" != "none" ] && MAX_TOK_ARGS=(--max-tokens "$MLX_MAX_TOKENS")
   PCB_ARGS=()
-  [ -n "${PROMPT_CACHE_BYTES:-}" ] && PCB_ARGS=(--cache-memory-mb "$(( PROMPT_CACHE_BYTES / 1048576 ))")
+  if [ -n "${PROMPT_CACHE_BYTES:-}" ]; then
+    PCB_ARGS=(--cache-memory-mb "$(( PROMPT_CACHE_BYTES / 1048576 ))")
+  else
+    PCB_ARGS=(--cache-memory-percent 0.35)
+  fi
 
   # Resolve the tool-call parser for MODEL_ID (override via TOOL_CALL_PARSER env var).
   _detect_tool_parser() {
@@ -76,6 +83,8 @@ if m and m.get('tool_parser'): print(m['tool_parser'])
   "$VENV/bin/vllm-mlx" serve "$MODEL_ID" --port "$MLX_PORT" \
     "${MAX_TOK_ARGS[@]}" "${PCB_ARGS[@]}" "${TOOL_PARSER_ARGS[@]}" \
     --kv-cache-quantization \
+    --stream-interval 4 \
+    --timeout 600 \
     >> "$MLX_LOG" 2>&1 &
   MLX_PID=$!
 

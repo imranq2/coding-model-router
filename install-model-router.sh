@@ -1107,6 +1107,10 @@ claude-router() {
   env -u ANTHROPIC_API_KEY \\
     ANTHROPIC_BASE_URL="http://localhost:$ROUTER_PORT" \\
     ANTHROPIC_MODEL="opusplan" \\
+    DISABLE_NON_ESSENTIAL_MODEL_CALLS="1" \\
+    DISABLE_AUTOUPDATER="1" \\
+    DISABLE_TELEMETRY="1" \\
+    DISABLE_ERROR_REPORTING="1" \\
     claude \\
       "\$@"
 }
@@ -1129,6 +1133,10 @@ claude-router() {
   ANTHROPIC_BASE_URL="http://localhost:$ROUTER_PORT" \\
     ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \\
     ANTHROPIC_MODEL="opusplan" \\
+    DISABLE_NON_ESSENTIAL_MODEL_CALLS="1" \\
+    DISABLE_AUTOUPDATER="1" \\
+    DISABLE_TELEMETRY="1" \\
+    DISABLE_ERROR_REPORTING="1" \\
     claude \\
       "\$@"
 }
