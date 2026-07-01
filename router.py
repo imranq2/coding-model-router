@@ -1143,23 +1143,14 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                 "[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map)
             )
 
-    # Apply max_tokens enforcement (补充说明: the dynamic context calculation above
-    # has already capped max_tokens if needed). For remote routes, only raise if below
-    # route_max_tokens (the floor behavior). The dynamic cap ensures we never exceed
-    # the context window minus estimated input, so a simple floor is safe here.
+    # route_max_tokens is the model's hard output limit — enforce as a ceiling for all
+    # route types. Never raise max_tokens here: for remote routes the dynamic context
+    # window cap above may have already reduced it below route_max_tokens to fit within
+    # the remaining context, and raising it back would undo that work.
     if route_max_tokens is not None:
-        if auth == "none":
-            # Local: ceiling only — lower if exceeds route_max_tokens
-            if body_json.get("max_tokens", 0) > route_max_tokens:
-                body_json["max_tokens"] = route_max_tokens
-                body_changed = True
-        else:
-            # Remote route: floor only — raise if below route_max_tokens
-            # The dynamic calculation above already ensures we don't exceed context window,
-            # so this simple floor won't cause overflow.
-            if body_json.get("max_tokens", 0) < route_max_tokens:
-                body_json["max_tokens"] = route_max_tokens
-                body_changed = True
+        if body_json.get("max_tokens", 0) > route_max_tokens:
+            body_json["max_tokens"] = route_max_tokens
+            body_changed = True
 
     # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
     # to disable the reasoning chain that would otherwise appear as visible output).
