@@ -1094,24 +1094,30 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     # This prevents context overflow by capping output tokens when the input is large.
     route_context_window: int | None = route.get("context_window")
     if route_context_window is not None and auth != "none":
-        # Estimate input tokens from the request body (4 chars ≈ 1 token)
-        estimated_input_tokens = _estimate_input_tokens(body_json)
+        # Estimate input tokens. The char-based heuristic (4 chars ≈ 1 token) undercounts
+        # because it misses structural tokens added by the model's chat template: role
+        # delimiters, tool-call markers, BOS/EOS tokens, and JSON punctuation that tokenizes
+        # at higher density than prose. Apply a 20% safety multiplier so the cap fires before
+        # Bedrock rejects the request for exceeding the context window.
+        estimated_input_tokens = int(_estimate_input_tokens(body_json) * 1.20)
         remaining_tokens = route_context_window - estimated_input_tokens
         if remaining_tokens <= 0:
             remaining_tokens = 1  # at least 1 output token
-        # Use the minimum of route_max_tokens (if set) and remaining tokens
-        # for remote routes, we want to cap (not floor) when the remaining context is smaller
         if route_max_tokens is not None:
             effective_max_tokens = min(route_max_tokens, remaining_tokens)
         else:
             effective_max_tokens = remaining_tokens
-        # Only apply if Claude Code requested more than we can provide
-        if body_json.get("max_tokens", 0) > effective_max_tokens:
+        requested_max = body_json.get("max_tokens", 0)
+        log.info(
+            "[model-router] context window: estimated_input=%d remaining=%d effective_max=%d requested=%d",
+            estimated_input_tokens, remaining_tokens, effective_max_tokens, requested_max,
+        )
+        if requested_max > effective_max_tokens:
             body_json["max_tokens"] = effective_max_tokens
             body_changed = True
             log.info(
-                "[model-router] dynamic max_tokens: input=%d remaining=%d capped=%d",
-                estimated_input_tokens, remaining_tokens, effective_max_tokens
+                "[model-router] dynamic max_tokens: capped %d → %d",
+                requested_max, effective_max_tokens,
             )
 
     tool_name_map: dict[str, str] = {}
