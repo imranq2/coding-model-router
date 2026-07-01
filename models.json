@@ -85,7 +85,7 @@
     {
       "id":               "qwen.qwen3-coder-30b-a3b-v1:0",
       "context_window":   262144,
-      "max_output_tokens": 32768,
+      "max_output_tokens": 65536,
       "api_type":         "openai",
       "price_per_mtok":   0.15,
       "reason":           "Best Bedrock coding model (default)"
@@ -93,7 +93,7 @@
     {
       "id":               "qwen.qwen3-coder-next",
       "context_window":   262144,
-      "max_output_tokens": 32768,
+      "max_output_tokens": 65536,
       "api_type":         "openai",
       "price_per_mtok":   0.50,
       "reason":           "Next-gen Qwen Coder on Bedrock"
@@ -119,8 +119,8 @@
   "anthropic_models": [
     {"tier": "haiku",  "id": "claude-haiku-4-5-20251001", "max_output_tokens": null,  "price_per_mtok": 1.0},
     {"tier": "sonnet", "id": "claude-sonnet-4-6",          "max_output_tokens": null,  "price_per_mtok": 3.0},
-    {"tier": "opus",   "id": "claude-opus-4-8",            "max_output_tokens": 32768, "price_per_mtok": 5.0},
-    {"tier": "fable",  "id": "claude-fable-5",             "max_output_tokens": 32768, "price_per_mtok": 10.0}
+    {"tier": "opus",   "id": "claude-opus-4-8",            "max_output_tokens": 65536, "price_per_mtok": 5.0},
+    {"tier": "fable",  "id": "claude-fable-5",             "max_output_tokens": 65536, "price_per_mtok": 10.0}
   ],
 
   "defaults": {
