@@ -1119,14 +1119,32 @@ async def proxy_messages(request: Request) -> StreamingResponse:
             estimated_input_tokens, remaining_tokens, requested_max,
         )
         if remaining_tokens <= 0:
-            # Estimated input already fills the context window — reducing max_tokens won't
-            # help and capping to 1 produces useless responses. Skip the dynamic cap and
-            # let the route_max_tokens ceiling (below) apply. If Bedrock truly overflows,
-            # the context-overflow retry loop will halve max_tokens and retry.
+            # The 1.20x safety multiplier pushed the estimate over the context window.
+            # Recover the raw (pre-multiplier) estimate and use 70% of its remaining
+            # capacity as max_tokens — much closer to the real working value than
+            # the route ceiling (65536), so the Bedrock retry loop needs fewer halvings.
+            raw_estimate = int(estimated_input_tokens / 1.20)
+            raw_remaining = route_context_window - raw_estimate
             log.warning(
-                "[model-router] input estimate (%d) >= context_window (%d); skipping dynamic cap",
-                estimated_input_tokens, route_context_window,
+                "[model-router] 1.20x estimate (%d) >= context_window (%d); "
+                "raw_estimate=%d raw_remaining=%d",
+                estimated_input_tokens, route_context_window, raw_estimate, raw_remaining,
             )
+            if raw_remaining > 0:
+                smart_max = max(1024, int(raw_remaining * 0.70))
+                if route_max_tokens is not None:
+                    smart_max = min(smart_max, route_max_tokens)
+                if requested_max > smart_max:
+                    body_json["max_tokens"] = smart_max
+                    body_changed = True
+                    log.warning(
+                        "[model-router] overflow: seeding max_tokens=%d "
+                        "(raw_remaining=%d × 70%%)",
+                        smart_max, raw_remaining,
+                    )
+            # If raw_remaining <= 0 the input is genuinely too large for any output;
+            # let the route_max_tokens ceiling apply and the Bedrock response will be
+            # an irrecoverable overflow error surfaced directly to Claude Code.
         else:
             if route_max_tokens is not None:
                 effective_max_tokens = min(route_max_tokens, remaining_tokens)
@@ -1276,8 +1294,23 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                         # Prefer raw response body for regex matching (more reliable than str(exc))
                         _resp = getattr(peek_exc, "response", None)
                         _peek_text = (getattr(_resp, "text", None) or str(peek_exc))
-                        if _CONTEXT_OVERFLOW_RE.search(str(peek_exc)) and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
-                            # Halve max_tokens on each attempt: 32768 → 16384 → 8192 → 4096 → 2048
+                        _overflow_match = _CONTEXT_OVERFLOW_RE.search(str(peek_exc))
+                        if _overflow_match and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
+                            # Check whether the overflow is input-driven (irrecoverable) by
+                            # comparing the reported input token count to the context window.
+                            # Bedrock reports "input = context_window + 1 - max_tokens", so
+                            # actual_input ≈ reported_N + current_max_tokens - 1. If
+                            # actual_input >= context_window, no max_tokens value can fix it.
+                            _reported_n = int(_overflow_match.group(1))
+                            _actual_input_approx = _reported_n + oai_kwargs.get("max_tokens", 0) - 1
+                            if route_context_window and _actual_input_approx >= route_context_window:
+                                log.error(
+                                    "[model-router] input (%d tokens) >= context_window (%d); "
+                                    "overflow is irrecoverable — not retrying. Use /compact.",
+                                    _actual_input_approx, route_context_window,
+                                )
+                                raise
+                            # Halve max_tokens on each attempt: e.g. 30371 → 15185 → 7592 → 3796
                             _overflow_attempt += 1
                             oai_kwargs["max_tokens"] = max(1, _original_max >> _overflow_attempt)
                             log.warning(
