@@ -1096,9 +1096,9 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         body_json["model"] = upstream_model
         body_changed = True
 
-    # Claude Code caps max_tokens based on the claude model name in the request, which may be
-    # far below what the upstream model actually supports. When the route config specifies
-    # max_tokens, use it as a floor for every route type — local, Bedrock, or passthrough.
+    # route_max_tokens is the upstream model's hard output ceiling — the most it can generate
+    # in one call (e.g. 32768 for Qwen3-30B-A3B, model-specific for Bedrock). Used as a
+    # ceiling: never let max_tokens in the forwarded request exceed what the upstream accepts.
     # When absent from the route config, leave the request unchanged.
     route_max_tokens: int | None = route.get("max_tokens")
 
