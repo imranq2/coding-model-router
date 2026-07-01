@@ -1218,6 +1218,7 @@ async def proxy_messages(request: Request) -> StreamingResponse:
             api_key="dummy",   # SigV4 / no-auth routes don't need a real key
             base_url=base_url,
             http_client=http_client,
+            max_retries=0,     # disable SDK retries — our retry loop controls backoff
         )
 
         # body_json is already OpenAI-format (translated above); exclude `stream`
@@ -1243,16 +1244,23 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                     if _overflow_attempt > 0 or _throttle_attempt > 0:
                         await http_client.aclose()
                         http_client = httpx.AsyncClient(auth=_auth, timeout=None)
-                        oai_client = openai.AsyncOpenAI(api_key="dummy", base_url=base_url, http_client=http_client)
-                    stream = await oai_client.chat.completions.create(**oai_kwargs, stream=True, stream_options={"include_usage": True})
+                        oai_client = openai.AsyncOpenAI(api_key="dummy", base_url=base_url, http_client=http_client, max_retries=0)
+                    stream = None
                     try:
+                        # create() is inside the try so throttle errors it raises (after
+                        # SDK-level retries) are caught by the same retry/backoff logic as
+                        # errors from __anext__().
+                        stream = await oai_client.chat.completions.create(**oai_kwargs, stream=True, stream_options={"include_usage": True})
                         first_chunk = await stream.__anext__()
                         break  # success — proceed with this stream
                     except Exception as peek_exc:
-                        await stream.close()
+                        if stream is not None:
+                            await stream.close()
                         _status = getattr(peek_exc, "status_code", None)
-                        _peek_text = str(peek_exc)
-                        if _CONTEXT_OVERFLOW_RE.search(_peek_text) and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
+                        # Prefer raw response body for regex matching (more reliable than str(exc))
+                        _resp = getattr(peek_exc, "response", None)
+                        _peek_text = (getattr(_resp, "text", None) or str(peek_exc))
+                        if _CONTEXT_OVERFLOW_RE.search(str(peek_exc)) and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
                             # Halve max_tokens on each attempt: 32768 → 16384 → 8192 → 4096 → 2048
                             _overflow_attempt += 1
                             oai_kwargs["max_tokens"] = max(1, _original_max >> _overflow_attempt)
