@@ -97,10 +97,12 @@ suppression mechanisms, one for each code path:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -267,6 +269,93 @@ class _SigV4Auth(httpx.Auth):
         for k, v in signed.items():
             request.headers[k.lower()] = v
         yield request
+
+
+# ---------------------------------------------------------------------------
+# Retry/backoff for Bedrock throttling
+# ---------------------------------------------------------------------------
+#
+# Bedrock's on-demand ("Mantle") endpoints scale capacity gradually rather than
+# instantly — a request rate that ramps up faster than the endpoint can scale
+# (roughly, more than doubling within a ~30 minute window) gets rejected with a
+# throttling error even though the account is nowhere near its steady-state
+# quota. This is transient: retrying with backoff almost always succeeds once
+# Bedrock's autoscaler catches up, so these are retried separately from the
+# context-overflow retry loop above, which handles a different, non-transient
+# error.
+
+_MAX_THROTTLE_RETRIES = 5
+_THROTTLE_BASE_DELAY_S = 1.0
+_THROTTLE_MAX_DELAY_S = 20.0
+
+_THROTTLE_TEXT_RE = re.compile(
+    r"throttl|too many requests|rate.?limit|try again later|increase.*traffic|traffic.*increase",
+    re.IGNORECASE,
+)
+
+
+def _throttle_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with full jitter (attempt is 0-indexed)."""
+    ceiling = min(_THROTTLE_MAX_DELAY_S, _THROTTLE_BASE_DELAY_S * (2**attempt))
+    return random.uniform(ceiling / 2, ceiling)
+
+
+def _is_throttling_status(status_code: int, body_text: str = "") -> bool:
+    """True if this looks like a Bedrock/AWS throttling response worth retrying."""
+    if status_code == 429:
+        return True
+    if status_code >= 400 and _THROTTLE_TEXT_RE.search(body_text or ""):
+        return True
+    return False
+
+
+async def _send_with_bedrock_retry(
+    client: httpx.AsyncClient,
+    target_url: str,
+    upstream_headers: dict,
+    raw_body: bytes,
+    route: dict,
+    auth: str,
+) -> httpx.Response:
+    """POST to target_url, retrying on Bedrock throttling with backoff + re-signed headers.
+
+    Only retries when auth == "aws" (Bedrock's on-demand endpoints are the ones that
+    throttle when request rate ramps too fast — see module note above). Other backends
+    (local, Anthropic passthrough) are sent once, unchanged, exactly as before.
+    """
+    attempt = 0
+    while True:
+        upstream_req = client.build_request(
+            "POST", target_url, headers=upstream_headers, content=raw_body
+        )
+        resp = await client.send(upstream_req, stream=True)
+
+        if auth != "aws" or resp.status_code < 400 or attempt >= _MAX_THROTTLE_RETRIES:
+            return resp
+
+        error_body = await resp.aread()
+        await resp.aclose()
+        error_text = error_body.decode("utf-8", errors="replace")
+
+        if not _is_throttling_status(resp.status_code, error_text):
+            # Not a throttling error — hand back an in-memory Response carrying the
+            # already-drained body so the caller's existing error-handling path
+            # (which also calls .aread()) works unchanged.
+            return httpx.Response(
+                status_code=resp.status_code, headers=resp.headers, content=error_body
+            )
+
+        delay = _throttle_backoff_seconds(attempt)
+        attempt += 1
+        log.warning(
+            "[model-router] Bedrock throttled (attempt %d/%d): backing off %.1fs — %s",
+            attempt, _MAX_THROTTLE_RETRIES, delay, error_text[:200],
+        )
+        await asyncio.sleep(delay)
+        # SigV4 signatures are time-scoped (~15 min skew tolerance) — re-sign before
+        # retrying rather than reusing a signature computed before the backoff sleep.
+        sig_headers = {k.lower(): v for k, v in _sign_bedrock(target_url, raw_body, route).items()}
+        upstream_headers = {**upstream_headers, **sig_headers}
 
 
 # ---------------------------------------------------------------------------
@@ -1123,8 +1212,10 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                 _MAX_OVERFLOW_RETRIES = 4
                 first_chunk = None
                 _original_max = oai_kwargs.get("max_tokens", route_context_window or 32768)
-                for _attempt in range(_MAX_OVERFLOW_RETRIES + 1):
-                    if _attempt > 0:
+                _overflow_attempt = 0
+                _throttle_attempt = 0
+                while True:
+                    if _overflow_attempt > 0 or _throttle_attempt > 0:
                         await http_client.aclose()
                         http_client = httpx.AsyncClient(auth=_auth, timeout=None)
                         oai_client = openai.AsyncOpenAI(api_key="dummy", base_url=base_url, http_client=http_client)
@@ -1134,14 +1225,28 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                         break  # success — proceed with this stream
                     except Exception as peek_exc:
                         await stream.close()
-                        if _CONTEXT_OVERFLOW_RE.search(str(peek_exc)) and _attempt < _MAX_OVERFLOW_RETRIES:
+                        _status = getattr(peek_exc, "status_code", None)
+                        _peek_text = str(peek_exc)
+                        if _CONTEXT_OVERFLOW_RE.search(_peek_text) and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
                             # Halve max_tokens on each attempt: 32768 → 16384 → 8192 → 4096 → 2048
-                            oai_kwargs["max_tokens"] = max(1, _original_max >> (_attempt + 1))
+                            _overflow_attempt += 1
+                            oai_kwargs["max_tokens"] = max(1, _original_max >> _overflow_attempt)
                             log.warning(
-                                "[model-router] context overflow (attempt %d/%d): reducing max_tokens %d → %d",
-                                _attempt + 1, _MAX_OVERFLOW_RETRIES,
-                                _original_max >> _attempt, oai_kwargs["max_tokens"],
+                                "[model-router] context overflow (attempt %d/%d): reducing max_tokens → %d",
+                                _overflow_attempt, _MAX_OVERFLOW_RETRIES, oai_kwargs["max_tokens"],
                             )
+                        elif (
+                            _status is not None
+                            and _is_throttling_status(_status, _peek_text)
+                            and _throttle_attempt < _MAX_THROTTLE_RETRIES
+                        ):
+                            delay = _throttle_backoff_seconds(_throttle_attempt)
+                            _throttle_attempt += 1
+                            log.warning(
+                                "[model-router] Bedrock throttled (attempt %d/%d): backing off %.1fs",
+                                _throttle_attempt, _MAX_THROTTLE_RETRIES, delay,
+                            )
+                            await asyncio.sleep(delay)
                         else:
                             raise
                 streaming_started = True
@@ -1151,7 +1256,25 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                     media_type="text/event-stream",
                 )
             else:
-                resp = await oai_client.chat.completions.create(**oai_kwargs, stream=False)
+                _throttle_attempt = 0
+                while True:
+                    try:
+                        resp = await oai_client.chat.completions.create(**oai_kwargs, stream=False)
+                        break
+                    except openai.APIStatusError as exc:
+                        if (
+                            _is_throttling_status(exc.status_code, exc.response.text)
+                            and _throttle_attempt < _MAX_THROTTLE_RETRIES
+                        ):
+                            delay = _throttle_backoff_seconds(_throttle_attempt)
+                            _throttle_attempt += 1
+                            log.warning(
+                                "[model-router] Bedrock throttled (attempt %d/%d): backing off %.1fs",
+                                _throttle_attempt, _MAX_THROTTLE_RETRIES, delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        raise
                 ant_resp = _openai_to_anthropic_response(resp.model_dump(), msg_id, upstream_model)
                 usage = ant_resp.get("usage", {})
                 _record_tokens(upstream_model, usage.get("input_tokens", 0), usage.get("output_tokens", 0), price_per_mtok, backend_label, tier)
@@ -1191,12 +1314,13 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                 await http_client.aclose()
 
     # ── Anthropic / local route: open upstream connection and stream verbatim ─
+    # (For auth == "aws" this transparently retries Bedrock throttling with backoff —
+    # see _send_with_bedrock_retry. Local/passthrough routes are sent once, unchanged.)
     client = httpx.AsyncClient(timeout=None)
     try:
-        upstream_req = client.build_request(
-            "POST", target_url, headers=upstream_headers, content=raw_body
+        upstream_resp = await _send_with_bedrock_retry(
+            client, target_url, upstream_headers, raw_body, route, auth
         )
-        upstream_resp = await client.send(upstream_req, stream=True)
     except Exception:
         await client.aclose()
         raise
