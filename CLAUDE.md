@@ -109,6 +109,49 @@ vllm-mlx enforces `^[A-Za-z0-9_-]{1,64}$` on tool names. The router sanitizes no
 
 Three top-level arrays (`local_models`, `bedrock_models`, `anthropic_models`) plus a `defaults` object with `tier_backends`, `ram_model_selection` (auto-picks model by detected RAM), and `ram_kv_cache_cap` (bounds the auto-compact window to prevent KV cache OOM). The installer parses this once via Python and caches results in shell variables.
 
+## Context window and token management
+
+### Why these env vars are set in `claude-router()`
+
+The shell function sets several `CLAUDE_CODE_*` vars that control how Claude Code manages context and output tokens when talking through the router. The values are intentionally different from plain `claude` defaults because the upstream model (Qwen on Bedrock) has different limits than Anthropic's claude-sonnet-4-6.
+
+| Env var | Value | Why |
+|---|---|---|
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `200000` | Prevents Claude Code from rejecting large incoming responses at the client side. Claude Code internally applies `min(this, model_known_max)` before sending `max_tokens` in requests — for claude-sonnet-4-6 that cap is 128K, so 200000 is a no-op on the request side. The high value is needed because Qwen BPE tokens ≠ Anthropic tokens (≈10–30% drift), so 65536 Qwen output tokens can exceed 64K Anthropic tokens in Claude Code's count. |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | `262144` | Set to Qwen's **actual** context window, not Anthropic Sonnet's 200K. This tells Claude Code when to compact. Undersizing it (e.g. 200000) would trigger compaction at 110K and waste 62K of real Qwen capacity. Oversizing it past 262144 would delay compaction until Bedrock rejects the request. |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | `55` | Compact at 55% × 262144 = ~144K tokens. This leaves 118K of clean headroom after each compact — enough for a full coding session without overflow. Plain claude-sonnet-4-6 compacts at 55% × 200K = 110K (90K headroom); we get more because Qwen has more context. |
+
+### How the router enforces max_tokens
+
+Claude Code sends `max_tokens=128000` in every request (result of `min(200000, 128000)`). The router then applies two caps before the request reaches Bedrock:
+
+1. **Dynamic context cap** — estimates input token count from character length, subtracts from `context_window` (262144 for Qwen), and caps `max_tokens` to the remainder. Prevents Bedrock from rejecting the request for context overflow.
+2. **Route ceiling** — hard cap from `router_config.json` (`max_tokens: 65536` for sonnet, `32768` for haiku). Matches the model's actual output limit.
+
+Effective max output per turn = `min(route_ceiling, remaining_context_after_input)`.
+
+### Tokenizer drift
+
+Qwen uses BPE tokenization; Anthropic uses its own tokenizer. The same content typically produces ~10–30% more Anthropic tokens than Qwen tokens. Consequences:
+
+- `CLAUDE_CODE_MAX_OUTPUT_TOKENS` must be set well above the Qwen `max_tokens` ceiling so Claude Code's client-side accept check doesn't fire.
+- The dynamic context cap uses a **1.20× multiplier** on character-estimated input size to account for this drift when computing remaining capacity.
+- When the 1.20× estimate overflows the context window, the router falls back to a raw (1.0×) estimate × 70% to seed `max_tokens`, minimising retry loops.
+
+### Context overflow retry loop
+
+If Bedrock rejects with a context overflow error despite the dynamic cap, `router.py` retries up to 4 times, halving `max_tokens` each attempt. The dynamic cap pre-seeds `max_tokens` close to the working value so retries converge quickly rather than starting from 128K.
+
+### Comparison with plain `claude` (Anthropic direct)
+
+| | Plain `claude` (Sonnet 4.6) | `claude-router` (Qwen/Bedrock) |
+|---|---|---|
+| Context window | 200K | 262K |
+| Compact trigger | 55% × 200K = 110K | 55% × 262K = 144K |
+| Post-compact headroom | 90K | 118K |
+| Max output / turn | 64K Anthropic tokens | 65536 Qwen tokens ≈ 64K |
+| Overflow enforcement | Anthropic server-side | Router dynamic cap + retry |
+
 ## Plans
 
 Implementation plans live in `docs/superpowers/plans/active/YYYY-MM-DD-slug.md`. See `docs/superpowers/README.md` for the index.
