@@ -1294,23 +1294,11 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                         # Prefer raw response body for regex matching (more reliable than str(exc))
                         _resp = getattr(peek_exc, "response", None)
                         _peek_text = (getattr(_resp, "text", None) or str(peek_exc))
-                        _overflow_match = _CONTEXT_OVERFLOW_RE.search(str(peek_exc))
-                        if _overflow_match and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
-                            # Check whether the overflow is input-driven (irrecoverable) by
-                            # comparing the reported input token count to the context window.
-                            # Bedrock reports "input = context_window + 1 - max_tokens", so
-                            # actual_input ≈ reported_N + current_max_tokens - 1. If
-                            # actual_input >= context_window, no max_tokens value can fix it.
-                            _reported_n = int(_overflow_match.group(1))
-                            _actual_input_approx = _reported_n + oai_kwargs.get("max_tokens", 0) - 1
-                            if route_context_window and _actual_input_approx >= route_context_window:
-                                log.error(
-                                    "[model-router] input (%d tokens) >= context_window (%d); "
-                                    "overflow is irrecoverable — not retrying. Use /compact.",
-                                    _actual_input_approx, route_context_window,
-                                )
-                                raise
-                            # Halve max_tokens on each attempt: e.g. 30371 → 15185 → 7592 → 3796
+                        if _CONTEXT_OVERFLOW_RE.search(str(peek_exc)) and _overflow_attempt < _MAX_OVERFLOW_RETRIES:
+                            # Halve max_tokens on each attempt: e.g. 26368 → 13184 → 6592 → 3296
+                            # Bedrock's error encodes "N = context_window + 1 - max_tokens" (a
+                            # formula, not the true input count), so we cannot reliably detect
+                            # irrecoverable overflow from the error text — just halve and retry.
                             _overflow_attempt += 1
                             oai_kwargs["max_tokens"] = max(1, _original_max >> _overflow_attempt)
                             log.warning(
