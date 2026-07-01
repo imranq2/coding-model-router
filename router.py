@@ -1113,24 +1113,32 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         # Bedrock rejects the request for exceeding the context window.
         estimated_input_tokens = int(_estimate_input_tokens(body_json) * 1.20)
         remaining_tokens = route_context_window - estimated_input_tokens
-        if remaining_tokens <= 0:
-            remaining_tokens = 1  # at least 1 output token
-        if route_max_tokens is not None:
-            effective_max_tokens = min(route_max_tokens, remaining_tokens)
-        else:
-            effective_max_tokens = remaining_tokens
         requested_max = body_json.get("max_tokens", 0)
         log.info(
-            "[model-router] context window: estimated_input=%d remaining=%d effective_max=%d requested=%d",
-            estimated_input_tokens, remaining_tokens, effective_max_tokens, requested_max,
+            "[model-router] context window: estimated_input=%d remaining=%d requested=%d",
+            estimated_input_tokens, remaining_tokens, requested_max,
         )
-        if requested_max > effective_max_tokens:
-            body_json["max_tokens"] = effective_max_tokens
-            body_changed = True
-            log.info(
-                "[model-router] dynamic max_tokens: capped %d → %d",
-                requested_max, effective_max_tokens,
+        if remaining_tokens <= 0:
+            # Estimated input already fills the context window — reducing max_tokens won't
+            # help and capping to 1 produces useless responses. Skip the dynamic cap and
+            # let the route_max_tokens ceiling (below) apply. If Bedrock truly overflows,
+            # the context-overflow retry loop will halve max_tokens and retry.
+            log.warning(
+                "[model-router] input estimate (%d) >= context_window (%d); skipping dynamic cap",
+                estimated_input_tokens, route_context_window,
             )
+        else:
+            if route_max_tokens is not None:
+                effective_max_tokens = min(route_max_tokens, remaining_tokens)
+            else:
+                effective_max_tokens = remaining_tokens
+            if requested_max > effective_max_tokens:
+                body_json["max_tokens"] = effective_max_tokens
+                body_changed = True
+                log.info(
+                    "[model-router] dynamic max_tokens: capped %d → %d",
+                    requested_max, effective_max_tokens,
+                )
 
     tool_name_map: dict[str, str] = {}
 
