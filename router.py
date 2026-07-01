@@ -316,6 +316,12 @@ _THROTTLE_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches Bedrock's context-window overflow error. Defined at module level so
+# _is_throttling_status can explicitly exclude it — context overflow is a
+# deterministic failure (input too large) that requires modifying the request,
+# not a transient server-side error that resolves on retry.
+_CONTEXT_OVERFLOW_RE = re.compile(r"contains at least (\d+) input tokens", re.IGNORECASE)
+
 
 def _throttle_backoff_seconds(attempt: int) -> float:
     """Exponential backoff with full jitter (attempt is 0-indexed)."""
@@ -324,7 +330,13 @@ def _throttle_backoff_seconds(attempt: int) -> float:
 
 
 def _is_throttling_status(status_code: int, body_text: str = "") -> bool:
-    """True if this looks like a Bedrock/AWS throttling response worth retrying."""
+    """True only for transient Bedrock/AWS throttling responses worth blind-retrying.
+
+    Explicitly excludes context-window overflow (deterministic — retrying the same
+    request without modifying max_tokens will always fail again).
+    """
+    if _CONTEXT_OVERFLOW_RE.search(body_text or ""):
+        return False  # not transient — caller must reduce max_tokens before retrying
     if status_code == 429:
         return True
     if status_code >= 400 and _THROTTLE_TEXT_RE.search(body_text or ""):
@@ -1233,7 +1245,6 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         msg_id = _msg_id()
         log.info("[model-router] openai request body: %s", json.dumps(oai_kwargs, default=str)[:2000])
         streaming_started = False
-        _CONTEXT_OVERFLOW_RE = re.compile(r"contains at least (\d+) input tokens")
         try:
             if is_streaming:
                 # Peek at the first chunk before committing to StreamingResponse so we can
