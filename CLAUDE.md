@@ -56,7 +56,7 @@ python3 test-bedrock.py [--router-port 8771] [--model claude-sonnet-4-6]
 | `tokenizer.py` | HuggingFace tokenizer loading + exact token counting (Bedrock/Qwen routes with `tokenizer_model` configured) |
 | `context_manager.py` | Preflight context-budget enforcement: tool-result compression + oldest-message dropping |
 | `usage_stats.py` | Cumulative token stats + the stdout "savings ticker" |
-| `stream_converter.py` | SSE streaming translation (OpenAI SDK stream → Anthropic SSE) |
+| `stream_converter.py` | SSE streaming translation (OpenAI SDK stream → Anthropic SSE) and Anthropic-passthrough streaming (tool-name restoration, `<think>` stripping) |
 | `models.json` | Model catalog — context windows, RAM thresholds, Bedrock IDs, tier defaults. Edit here; re-run installer to apply. |
 | `start-model-router.sh` | Launches vllm-mlx (optional) then router.py; waits for vllm-mlx readiness before starting router |
 | `stop-model-router.sh` | Kills running processes by PID file |
@@ -139,7 +139,7 @@ Claude Code sends `max_tokens=128000` in every request (result of `min(200000, 1
 
 **Strategy B — character-heuristic (all other routes, including local/vllm-mlx):** estimates input token count from character length (4 chars ≈ 1 token, 1.20× safety multiplier), subtracts from `context_window`, and caps `max_tokens` to the remainder, minus a fixed `_TOKEN_ESTIMATE_SAFETY_BUFFER` (100 tokens) to absorb estimation imprecision on dense content like JSON/tool schemas.
 
-Both strategies are additionally bounded by the **route ceiling** — a hard cap from `router_config.json` (`max_tokens: 65536` for sonnet, `32768` for haiku) matching the model's actual output limit. A reactive halving-retry loop (below) remains as a last-resort safety net for both strategies.
+Both strategies are additionally bounded by the **route ceiling** — a hard cap from `router_config.json` (`max_tokens: 65536` for sonnet, `32768` for haiku) matching the model's actual output limit. A reactive halving-retry loop (below) remains as a last-resort safety net for streaming `api_type: "openai"` routes (covers both strategies there, since it fires on the translated Bedrock response regardless of which one prepared the request). Non-streaming OpenAI requests get throttle-retry only, no overflow halving; local/Anthropic-passthrough/Anthropic-format-Bedrock routes rely on the dynamic cap alone — `_send_with_bedrock_retry` retries only on throttling, never on context overflow.
 
 ### Tokenizer drift
 
@@ -158,7 +158,7 @@ If Bedrock rejects with a context overflow error despite the dynamic cap, `route
 Two new optional route fields (see `router.py`'s module docstring for the full list):
 
 - `claude_model_pattern` — regex checked on an exact `claude_model` lookup miss, so a route keeps matching future Claude Code model-id version bumps (e.g. `claude-sonnet-4-6` → `claude-sonnet-5`) without a `models.json` edit + reinstall.
-- `tokenizer_model` / `backend_max_context_tokens` / `reserved_output_tokens` / `tokenizer_safety_margin` — activate Strategy A (above) for a route. Currently set on the two Qwen Bedrock entries in `models.json`.
+- `tokenizer_model` / `backend_max_context_tokens` / `reserved_output_tokens` / `tokenizer_safety_margin` — activate Strategy A (above) for a route. `tokenizer_model` and `tokenizer_safety_margin` are set directly on the two Qwen Bedrock entries in `models.json`; `backend_max_context_tokens` and `reserved_output_tokens` are derived by the installer from those entries' `context_window`/`max_output_tokens` and written into the generated `router_config.json`.
 
 ### Comparison with plain `claude` (Anthropic direct)
 
