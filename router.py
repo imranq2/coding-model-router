@@ -278,6 +278,7 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     model = body_json.get("model", "")
     route = find_route(model)
     is_fallback_route = route is None
+    request_id = _msg_id()
 
     # Suffix is "" for /v1/messages or "/count_tokens" for the count_tokens endpoint.
     req_suffix = request.url.path[len("/v1/messages"):]
@@ -641,7 +642,7 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     client = httpx.AsyncClient(timeout=None)
     try:
         upstream_resp = await _send_with_bedrock_retry(
-            client, target_url, upstream_headers, raw_body, route, auth
+            client, target_url, upstream_headers, raw_body, route, auth, request_id
         )
     except Exception:
         await client.aclose()
@@ -652,7 +653,8 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         error_body = await upstream_resp.aread()
         await client.aclose()
         log.error(
-            "[model-router] upstream %d from %s: %s",
+            "[model-router] request_id=%s upstream %d from %s: %s",
+            request_id,
             upstream_resp.status_code,
             target_url,
             error_body[:1000].decode("utf-8", errors="replace"),
