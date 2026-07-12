@@ -125,6 +125,7 @@ from constants import (
     _THROTTLE_TEXT_RE,
 )
 from tool_sanitizer import _sanitize_tools
+from route_config import CONFIG, CONFIG_PATH, ROUTES, find_route
 
 # Logs go to stderr — start-model-router.sh redirects stderr to the log file.
 # stdout is reserved for the live status line only.
@@ -137,43 +138,6 @@ logging.basicConfig(
 log = logging.getLogger("model-router")
 
 _STDOUT_IS_TTY = sys.stdout.isatty()
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-CONFIG_PATH = Path(
-    os.environ.get("ROUTER_CONFIG", Path.home() / "model-router" / "router_config.json")
-)
-
-
-def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
-
-
-try:
-    CONFIG: dict = load_config()
-except FileNotFoundError:
-    log.error(
-        "[model-router] config not found at %s — run install-model-router first; starting with no routes",
-        CONFIG_PATH,
-    )
-    CONFIG = {"routes": []}
-
-# Key routes by claude_model (what Claude Code sends) for O(1) lookup.
-# Warn on duplicates rather than silently dropping earlier entries.
-ROUTES: dict[str, dict] = {}
-for _r in CONFIG.get("routes", []):
-    _key = _r["claude_model"]
-    if _key in ROUTES:
-        log.warning("[model-router] duplicate route for model '%s' — later entry wins", _key)
-    ROUTES[_key] = _r
-
-
-def find_route(model: str) -> dict | None:
-    return ROUTES.get(model)
-
 
 # Reference price for savings comparison — read from the opus route in config, fallback to $5/MTok.
 _OPUS_PRICE_PER_MTOK: float = next(
