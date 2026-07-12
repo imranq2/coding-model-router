@@ -221,6 +221,8 @@ def _annotate_fallback_error(error_body: bytes, model: str) -> bytes:
         parsed = json.loads(error_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return note.encode() + error_body
+    if not isinstance(parsed, dict):
+        return note.encode() + error_body
     error_obj = parsed.get("error")
     if isinstance(error_obj, dict) and isinstance(error_obj.get("message"), str):
         error_obj["message"] = note + error_obj["message"]
