@@ -22,9 +22,11 @@ def _estimate_input_tokens(body_json: dict) -> int:
     """
     total_chars = 0
 
+    # Count system prompt
     if system := body_json.get("system"):
         total_chars += len(_anthropic_content_to_text(system))
 
+    # Count all message content (text, tool_use, and tool_result blocks)
     for msg in body_json.get("messages", []):
         content = msg.get("content", "")
         if isinstance(content, str):
@@ -48,6 +50,7 @@ def _estimate_input_tokens(body_json: dict) -> int:
                             if rb.get("type") == "text":
                                 total_chars += len(rb.get("text", ""))
 
+    # Count tool definitions (name + description + input_schema)
     for tool in body_json.get("tools", []):
         total_chars += len(tool.get("name", ""))
         total_chars += len(tool.get("description", ""))
@@ -55,27 +58,8 @@ def _estimate_input_tokens(body_json: dict) -> int:
         if schema:
             total_chars += len(json.dumps(schema))
 
+    # Convert characters to tokens (4 chars ≈ 1 token), round up to be conservative
     return (total_chars + 3) // 4
-
-
-def _convert_user_content(blocks: list) -> str | list:
-    """Convert a list of non-tool-result Anthropic content blocks to OpenAI user content."""
-    text_only = all(b.get("type") == "text" for b in blocks)
-    if text_only:
-        return "\n".join(b.get("text", "") for b in blocks)
-    result = []
-    for block in blocks:
-        btype = block.get("type")
-        if btype == "text":
-            result.append({"type": "text", "text": block.get("text", "")})
-        elif btype == "image":
-            src = block.get("source", {})
-            if src.get("type") == "base64":
-                url = f"data:{src.get('media_type', 'image/jpeg')};base64,{src.get('data', '')}"
-            else:
-                url = src.get("url", "")
-            result.append({"type": "image_url", "image_url": {"url": url}})
-    return result
 
 
 def _anthropic_to_openai_request(body_json: dict) -> dict:
@@ -88,6 +72,7 @@ def _anthropic_to_openai_request(body_json: dict) -> dict:
 
     messages: list = []
 
+    # System prompt — top-level in Anthropic, becomes role:system in OpenAI
     if system := body_json.get("system"):
         messages.append({"role": "system", "content": _anthropic_content_to_text(system)})
 
@@ -123,9 +108,12 @@ def _anthropic_to_openai_request(body_json: dict) -> dict:
 
         elif role == "user":
             if isinstance(content, list):
+                # tool_result blocks become separate role:tool messages.
+                # Non-tool-result blocks stay as role:user content.
                 pending: list = []
                 for block in content:
                     if block.get("type") == "tool_result":
+                        # Flush any accumulated user content first
                         if pending:
                             messages.append({"role": "user", "content": _convert_user_content(pending)})
                             pending = []
@@ -169,6 +157,27 @@ def _anthropic_to_openai_request(body_json: dict) -> dict:
             oai["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
 
     return oai
+
+
+def _convert_user_content(blocks: list) -> str | list:
+    """Convert a list of non-tool-result Anthropic content blocks to OpenAI user content."""
+    text_only = all(b.get("type") == "text" for b in blocks)
+    if text_only:
+        return "\n".join(b.get("text", "") for b in blocks)
+    # Mixed content (e.g. images) — build OpenAI content array
+    result = []
+    for block in blocks:
+        btype = block.get("type")
+        if btype == "text":
+            result.append({"type": "text", "text": block.get("text", "")})
+        elif btype == "image":
+            src = block.get("source", {})
+            if src.get("type") == "base64":
+                url = f"data:{src.get('media_type', 'image/jpeg')};base64,{src.get('data', '')}"
+            else:
+                url = src.get("url", "")
+            result.append({"type": "image_url", "image_url": {"url": url}})
+    return result
 
 
 def _openai_to_anthropic_response(resp_json: dict, msg_id: str, upstream_model: str) -> dict:
