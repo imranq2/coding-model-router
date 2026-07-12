@@ -64,9 +64,11 @@ else
 fi
 MODELS_CONFIG="${SCRIPT_DIR:+$SCRIPT_DIR/}models.json"
 
-# GitHub repo for fetching additional files when run via curl
+# GitHub repo for fetching additional files when run via curl. Override GITHUB_BRANCH via
+# MODEL_ROUTER_GITHUB_REF (e.g. a PR's head SHA) to bootstrap from unmerged commits — used by
+# the CI smoke tests, which otherwise download the bundle from main and can't see PR-only files.
 GITHUB_REPO="imranq2/coding-model-router"
-GITHUB_BRANCH="main"
+GITHUB_BRANCH="${MODEL_ROUTER_GITHUB_REF:-main}"
 
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" != "$DIR" ]; then
   # Detect if we're running via curl/stdin: SCRIPT_DIR is empty, or the files don't actually
