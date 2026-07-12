@@ -54,6 +54,22 @@ Optional fields:
   chat_template_kwargs  Extra kwargs passed to the tokenizer's apply_chat_template.
                         For Qwen3 local routes: {"enable_thinking": false} disables
                         the reasoning chain, preventing slow "Thinking Process:" output.
+  claude_model_pattern  Regex checked on an exact claude_model lookup miss, so a
+                        route keeps matching future Claude Code model-id version
+                        bumps (e.g. "^claude-sonnet(-|$)") without a config edit.
+  tokenizer_model       HuggingFace tokenizer id (e.g. "Qwen/Qwen3-Coder-30B-A3B-Instruct").
+                        When set on an api_type: "openai" route, enables Strategy A —
+                        exact token counting + preflight compression (context_manager.py)
+                        instead of the character-heuristic (Strategy B).
+  backend_max_context_tokens / reserved_output_tokens / tokenizer_safety_margin
+                        Strategy A budget inputs — see context_manager.py docstring.
+
+MODULE LAYOUT
+-------------
+This file is the FastAPI app + request orchestration only. Supporting logic lives
+in sibling modules: constants.py, tool_sanitizer.py, aws_auth.py, bedrock_client.py,
+route_config.py, message_translator.py, tokenizer.py, context_manager.py,
+usage_stats.py, stream_converter.py.
 
 EXAMPLE CONFIG
 --------------
@@ -98,40 +114,38 @@ suppression mechanisms, one for each code path:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import re
 import sys
 from pathlib import Path
-from typing import AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from aws_auth import _SigV4Auth, _sign_bedrock
 from bedrock_client import _is_throttling_status, _send_with_bedrock_retry, _throttle_backoff_seconds
 from constants import (
     _ANTHROPIC_ONLY_HEADERS,
-    _BEDROCK_MIN_DISPATCH_INTERVAL_S,
     _CONTEXT_OVERFLOW_RE,
     _HOP_BY_HOP,
     _MAX_THROTTLE_RETRIES,
-    _OAI_TO_ANT_STOP,
     _SKIP_HEADERS,
-    _THROTTLE_BASE_DELAY_S,
-    _THROTTLE_MAX_DELAY_S,
-    _THROTTLE_TEXT_RE,
+    _TOKEN_ESTIMATE_SAFETY_BUFFER,
 )
+from context_manager import enforce_context_budget
 from message_translator import (
     _anthropic_to_openai_request,
     _estimate_input_tokens,
     _openai_to_anthropic_response,
 )
-from stream_converter import _msg_id, _oai_stream_with_cleanup, _sse_event, _stream_logging
-from tool_sanitizer import _sanitize_tools
 from route_config import CONFIG_PATH, ROUTES, find_route
+from stream_converter import _msg_id, _oai_stream_with_cleanup, _sse_event, _stream_logging
+from tokenizer import count_oai_request_tokens
+from tool_sanitizer import _sanitize_tools
 from usage_stats import _record_tokens
 
 # Logs go to stderr — start-model-router.sh redirects stderr to the log file.
@@ -144,10 +158,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("model-router")
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-
 
 def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
     """Return the error text as a valid Anthropic assistant message (status 200).
@@ -155,8 +165,6 @@ def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
     Claude Code only shows text to the user when it receives a valid 200 response.
     HTTP 4xx/5xx are surfaced as opaque API errors with no actionable message.
     """
-    from fastapi.responses import JSONResponse, StreamingResponse
-
     msg_id = _msg_id()
     if not is_streaming:
         return JSONResponse({
@@ -196,6 +204,30 @@ def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
     return StreamingResponse(_stream(), status_code=200, media_type="text/event-stream")
 
 
+def _annotate_fallback_error(error_body: bytes, model: str) -> bytes:
+    """Prefix an upstream error with a note explaining that this request had no
+    configured route and went directly to Anthropic — without cost-routing or
+    context-budget enforcement. Without this, a fallback request that later hits
+    a real context-length error just looks like a bare, unexplained "context
+    exceeded" failure with no link back to the actual root cause (a missing/stale
+    route entry in models.json).
+    """
+    note = (
+        f"[model-router] model '{model}' has no configured route — this request "
+        "went directly to Anthropic without cost-routing or context-budget "
+        "enforcement. Original error: "
+    )
+    try:
+        parsed = json.loads(error_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return note.encode() + error_body
+    error_obj = parsed.get("error")
+    if isinstance(error_obj, dict) and isinstance(error_obj.get("message"), str):
+        error_obj["message"] = note + error_obj["message"]
+        return json.dumps(parsed).encode()
+    return note.encode() + error_body
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -226,7 +258,9 @@ async def proxy_messages(request: Request) -> StreamingResponse:
 
     Flow:
       1. Route lookup    — find config for the requested model (fallback: Anthropic direct).
-      2. Body mutations  — rewrite model name, enforce max_tokens, sanitize tool names,
+      2. Body mutations  — rewrite model name, enforce context budget (Strategy A:
+                           tokenizer-based preflight compression, or Strategy B:
+                           character-heuristic dynamic cap), sanitize tool names,
                            inject chat_template_kwargs (local routes).
       3. Header building — auth strategy determines upstream Authorization header.
       4. Dispatch        — OpenAI routes use the openai SDK + Anthropic translation;
@@ -237,12 +271,11 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     try:
         body_json = json.loads(raw_body)
     except json.JSONDecodeError:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     model = body_json.get("model", "")
     route = find_route(model)
+    is_fallback_route = route is None
 
     # Suffix is "" for /v1/messages or "/count_tokens" for the count_tokens endpoint.
     req_suffix = request.url.path[len("/v1/messages"):]
@@ -257,19 +290,27 @@ async def proxy_messages(request: Request) -> StreamingResponse:
 
     auth = route["auth"]
     api_type = route.get("api_type", "anthropic")
-    upstream_model = route["model"]
+    # Passthrough routes forward the client's exact model id — Anthropic is
+    # authoritative on which model ids exist, so a version-bumped id must never
+    # be silently overridden by a possibly-stale pinned config value. Bedrock/local
+    # routes DO rewrite to the configured backend model id, since that's a
+    # genuinely different upstream model, not just a version.
+    upstream_model = model if auth == "passthrough" else route["model"]
     is_streaming = bool(body_json.get("stream"))
     backend_label = {"none": "LOCAL", "aws": "BEDROCK"}.get(auth, "PASSTHROUGH")
     price_per_mtok: float = float(route.get("price_per_mtok", 0))
     tier: str = route.get("tier", "")
+    tokenizer_model: str | None = route.get("tokenizer_model")
 
     # Neither OpenAI endpoints nor vllm-mlx (Qwen3VL) handle /count_tokens reliably;
-    # return a rough estimate so Claude Code doesn't block on a 500.
-    if req_suffix == "/count_tokens" and (
-        api_type == "openai" or auth == "none"
-    ):
-        from fastapi.responses import JSONResponse
-
+    # return an estimate (exact, if a tokenizer is configured) so Claude Code doesn't
+    # block on a 500.
+    if req_suffix == "/count_tokens" and (api_type == "openai" or auth == "none"):
+        if api_type == "openai" and tokenizer_model:
+            oai_body_for_count = _anthropic_to_openai_request(body_json)
+            token_count = count_oai_request_tokens(oai_body_for_count, tokenizer_model)
+            if token_count is not None:
+                return JSONResponse({"input_tokens": token_count})
         return JSONResponse({"input_tokens": len(json.dumps(body_json)) // 4})
 
     # For Anthropic routes the URL has the suffix appended (supports /count_tokens).
@@ -290,97 +331,113 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     # ceiling: never let max_tokens in the forwarded request exceed what the upstream accepts.
     # When absent from the route config, leave the request unchanged.
     route_max_tokens: int | None = route.get("max_tokens")
-
-    # Dynamic context window enforcement — calculate remaining tokens based on input size.
-    # This prevents context overflow by capping output tokens when the input is large.
-    route_context_window: int | None = route.get("context_window")
-    if route_context_window is not None and auth != "none":
-        # Estimate input tokens. The char-based heuristic (4 chars ≈ 1 token) undercounts
-        # because it misses structural tokens added by the model's chat template: role
-        # delimiters, tool-call markers, BOS/EOS tokens, and JSON punctuation that tokenizes
-        # at higher density than prose. Apply a 20% safety multiplier so the cap fires before
-        # Bedrock rejects the request for exceeding the context window.
-        estimated_input_tokens = int(_estimate_input_tokens(body_json) * 1.20)
-        remaining_tokens = route_context_window - estimated_input_tokens
-        requested_max = body_json.get("max_tokens", 0)
-        log.info(
-            "[model-router] context window: estimated_input=%d remaining=%d requested=%d",
-            estimated_input_tokens, remaining_tokens, requested_max,
-        )
-        if remaining_tokens <= 0:
-            # The 1.20x safety multiplier pushed the estimate over the context window.
-            # Recover the raw (pre-multiplier) estimate and use 70% of its remaining
-            # capacity as max_tokens — much closer to the real working value than
-            # the route ceiling (65536), so the Bedrock retry loop needs fewer halvings.
-            raw_estimate = int(estimated_input_tokens / 1.20)
-            raw_remaining = route_context_window - raw_estimate
-            log.warning(
-                "[model-router] 1.20x estimate (%d) >= context_window (%d); "
-                "raw_estimate=%d raw_remaining=%d",
-                estimated_input_tokens, route_context_window, raw_estimate, raw_remaining,
-            )
-            if raw_remaining > 0:
-                smart_max = max(1024, int(raw_remaining * 0.70))
-                if route_max_tokens is not None:
-                    smart_max = min(smart_max, route_max_tokens)
-                if requested_max > smart_max:
-                    body_json["max_tokens"] = smart_max
-                    body_changed = True
-                    log.warning(
-                        "[model-router] overflow: seeding max_tokens=%d "
-                        "(raw_remaining=%d × 70%%)",
-                        smart_max, raw_remaining,
-                    )
-            # If raw_remaining <= 0 the input is genuinely too large for any output;
-            # let the route_max_tokens ceiling apply and the Bedrock response will be
-            # an irrecoverable overflow error surfaced directly to Claude Code.
-        else:
-            if route_max_tokens is not None:
-                effective_max_tokens = min(route_max_tokens, remaining_tokens)
-            else:
-                effective_max_tokens = remaining_tokens
-            if requested_max > effective_max_tokens:
-                body_json["max_tokens"] = effective_max_tokens
-                body_changed = True
-                log.info(
-                    "[model-router] dynamic max_tokens: capped %d → %d",
-                    requested_max, effective_max_tokens,
-                )
-
     tool_name_map: dict[str, str] = {}
 
-    # Tool name sanitization is vllm-mlx specific (local routes only).
-    if auth == "none":
-        body_json, tool_name_map = _sanitize_tools(body_json)
-        if tool_name_map:
-            body_changed = True
-            log.info(
-                "[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map)
-            )
-
-    # route_max_tokens is the model's hard output limit — enforce as a ceiling for all
-    # route types. Never raise max_tokens here: for remote routes the dynamic context
-    # window cap above may have already reduced it below route_max_tokens to fit within
-    # the remaining context, and raising it back would undo that work.
-    if route_max_tokens is not None:
-        if body_json.get("max_tokens", 0) > route_max_tokens:
-            body_json["max_tokens"] = route_max_tokens
-            body_changed = True
-
-    # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
-    # to disable the reasoning chain that would otherwise appear as visible output).
-    route_chat_template_kwargs: dict | None = route.get("chat_template_kwargs")
-    if route_chat_template_kwargs and api_type != "openai":
-        merged = {**route_chat_template_kwargs, **body_json.get("chat_template_kwargs", {})}
-        body_json["chat_template_kwargs"] = merged
-        body_changed = True
-
-    if api_type == "openai":
-        # Translate Anthropic → OpenAI; re-encode immediately.
+    # ── Context enforcement ───────────────────────────────────────────────────
+    #
+    # Two strategies, mutually exclusive:
+    #
+    # A. Tokenizer-based (preferred): translate to OpenAI format first, count tokens
+    #    with the real HF tokenizer + chat template, then compress/drop messages if
+    #    over budget. Activated when the route has a `tokenizer_model` field
+    #    (Bedrock/Qwen routes only).
+    #
+    # B. Character-based (fallback): 4-chars-per-token heuristic with a 1.20x safety
+    #    multiplier. Used for local routes, Anthropic-format Bedrock/passthrough
+    #    routes, and any OpenAI-format route without a `tokenizer_model` configured.
+    #
+    if tokenizer_model and api_type == "openai":
         body_json = _anthropic_to_openai_request(body_json)
+        body_json = enforce_context_budget(body_json, route, tokenizer_model)
         raw_body = json.dumps(body_json).encode()
-    elif body_changed:
-        raw_body = json.dumps(body_json).encode()
+    else:
+        # Dynamic context window enforcement — calculate remaining tokens based on input size.
+        # This prevents context overflow by capping output tokens when the input is large.
+        route_context_window: int | None = route.get("context_window")
+        if route_context_window is not None and auth != "none":
+            # Estimate input tokens. The char-based heuristic (4 chars ≈ 1 token) undercounts
+            # because it misses structural tokens added by the model's chat template: role
+            # delimiters, tool-call markers, BOS/EOS tokens, and JSON punctuation that tokenizes
+            # at higher density than prose. Apply a 20% safety multiplier so the cap fires before
+            # Bedrock rejects the request for exceeding the context window.
+            estimated_input_tokens = int(_estimate_input_tokens(body_json) * 1.20)
+            remaining_tokens = route_context_window - estimated_input_tokens
+            requested_max = body_json.get("max_tokens", 0)
+            log.info(
+                "[model-router] context window: estimated_input=%d remaining=%d requested=%d",
+                estimated_input_tokens, remaining_tokens, requested_max,
+            )
+            if remaining_tokens <= 0:
+                # The 1.20x safety multiplier pushed the estimate over the context window.
+                # Recover the raw (pre-multiplier) estimate and use 70% of its remaining
+                # capacity as max_tokens — much closer to the real working value than
+                # the route ceiling (65536), so the Bedrock retry loop needs fewer halvings.
+                raw_estimate = int(estimated_input_tokens / 1.20)
+                raw_remaining = route_context_window - raw_estimate
+                log.warning(
+                    "[model-router] 1.20x estimate (%d) >= context_window (%d); "
+                    "raw_estimate=%d raw_remaining=%d",
+                    estimated_input_tokens, route_context_window, raw_estimate, raw_remaining,
+                )
+                if raw_remaining > 0:
+                    smart_max = max(1024, int(raw_remaining * 0.70) - _TOKEN_ESTIMATE_SAFETY_BUFFER)
+                    if route_max_tokens is not None:
+                        smart_max = min(smart_max, route_max_tokens)
+                    if requested_max > smart_max:
+                        body_json["max_tokens"] = smart_max
+                        body_changed = True
+                        log.warning(
+                            "[model-router] overflow: seeding max_tokens=%d "
+                            "(raw_remaining=%d × 70%% − buffer)",
+                            smart_max, raw_remaining,
+                        )
+                # If raw_remaining <= 0 the input is genuinely too large for any output;
+                # let the route_max_tokens ceiling apply and the Bedrock response will be
+                # an irrecoverable overflow error surfaced directly to Claude Code.
+            else:
+                if route_max_tokens is not None:
+                    effective_max_tokens = min(route_max_tokens, remaining_tokens)
+                else:
+                    effective_max_tokens = remaining_tokens
+                effective_max_tokens = max(1, effective_max_tokens - _TOKEN_ESTIMATE_SAFETY_BUFFER)
+                if requested_max > effective_max_tokens:
+                    body_json["max_tokens"] = effective_max_tokens
+                    body_changed = True
+                    log.info(
+                        "[model-router] dynamic max_tokens: capped %d → %d",
+                        requested_max, effective_max_tokens,
+                    )
+
+        # Tool name sanitization is vllm-mlx specific (local routes only).
+        if auth == "none":
+            body_json, tool_name_map = _sanitize_tools(body_json)
+            if tool_name_map:
+                body_changed = True
+                log.info("[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map))
+
+        # route_max_tokens is the model's hard output limit — enforce as a ceiling for all
+        # route types. Never raise max_tokens here: for remote routes the dynamic context
+        # window cap above may have already reduced it below route_max_tokens to fit within
+        # the remaining context, and raising it back would undo that work.
+        if route_max_tokens is not None:
+            if body_json.get("max_tokens", 0) > route_max_tokens:
+                body_json["max_tokens"] = route_max_tokens
+                body_changed = True
+
+        # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
+        # to disable the reasoning chain that would otherwise appear as visible output).
+        route_chat_template_kwargs: dict | None = route.get("chat_template_kwargs")
+        if route_chat_template_kwargs and api_type != "openai":
+            merged = {**route_chat_template_kwargs, **body_json.get("chat_template_kwargs", {})}
+            body_json["chat_template_kwargs"] = merged
+            body_changed = True
+
+        if api_type == "openai":
+            # Translate Anthropic → OpenAI; re-encode immediately.
+            body_json = _anthropic_to_openai_request(body_json)
+            raw_body = json.dumps(body_json).encode()
+        elif body_changed:
+            raw_body = json.dumps(body_json).encode()
 
     # ── Build upstream headers ────────────────────────────────────────────────
     base_headers = _passthrough_headers(request)
@@ -388,9 +445,7 @@ async def proxy_messages(request: Request) -> StreamingResponse:
 
     # Strip Anthropic-specific headers before forwarding to OpenAI-format endpoints.
     if api_type == "openai":
-        base_headers = {
-            k: v for k, v in base_headers.items() if k.lower() not in _ANTHROPIC_ONLY_HEADERS
-        }
+        base_headers = {k: v for k, v in base_headers.items() if k.lower() not in _ANTHROPIC_ONLY_HEADERS}
 
     if auth == "none":
         upstream_headers = base_headers
@@ -432,7 +487,6 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     # ── OpenAI route: use openai SDK (typed chunks, SigV4 via httpx.Auth) ─────
     if api_type == "openai":
         import openai
-        from fastapi.responses import JSONResponse, Response
 
         # Strip /chat/completions suffix to get the base URL the SDK appends to.
         base_url = target_url.removesuffix("/chat/completions")
@@ -454,13 +508,16 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         try:
             if is_streaming:
                 # Peek at the first chunk before committing to StreamingResponse so we can
-                # detect context-overflow 400s (Bedrock sends HTTP 200 + error event in stream).
-                # Bedrock's error reports "input = context_window + 1 - max_tokens" (a formula,
-                # not the true count), so we can't compute the exact fix — instead we halve
-                # max_tokens on each attempt until it succeeds or we exhaust retries.
+                # detect context-overflow 400s (Bedrock sends HTTP 200 + error event in
+                # stream). This is a last-resort safety net: Strategy A's preflight
+                # compression already avoids most overflows for tokenizer-configured
+                # routes, but Strategy B routes (and any tokenizer under-estimate) still
+                # need it. Bedrock's error reports "input = context_window + 1 - max_tokens"
+                # (a formula, not the true count), so we can't compute the exact fix —
+                # halve max_tokens on each attempt until it succeeds or retries exhaust.
                 _MAX_OVERFLOW_RETRIES = 4
                 first_chunk = None
-                _original_max = oai_kwargs.get("max_tokens", route_context_window or 32768)
+                _original_max = oai_kwargs.get("max_tokens", route.get("context_window") or 32768)
                 _overflow_attempt = 0
                 _throttle_attempt = 0
                 while True:
@@ -478,7 +535,11 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                         break  # success — proceed with this stream
                     except Exception as peek_exc:
                         if stream is not None:
-                            await stream.close()
+                            # Handle both sync close() and async aclose()/close() — don't assume the
+                            # openai SDK's stream.close() is always a coroutine.
+                            _close_result = stream.close()
+                            if inspect.isawaitable(_close_result):
+                                await _close_result
                         _status = getattr(peek_exc, "status_code", None)
                         # Prefer raw response body for regex matching (more reliable than str(exc))
                         _resp = getattr(peek_exc, "response", None)
@@ -594,8 +655,8 @@ async def proxy_messages(request: Request) -> StreamingResponse:
             target_url,
             error_body[:1000].decode("utf-8", errors="replace"),
         )
-        from fastapi.responses import Response
-
+        if is_fallback_route:
+            error_body = _annotate_fallback_error(error_body, model)
         return Response(
             content=error_body,
             status_code=upstream_resp.status_code,
