@@ -18,7 +18,8 @@ to `superseded/` and add a pointer banner at the top.
 
 ## 👉 Active (in flight)
 
-_(none)_
+- **[`plans/active/2026-07-12-port-language-model-gateway-improvements.md`](plans/active/2026-07-12-port-language-model-gateway-improvements.md)**
+  — Split `router.py` into modules mirroring `language-model-gateway`'s layout, port 4 bug fixes + tokenizer-based context budgeting + regex route fallback. All 12 tasks implemented and reviewed on branch `port-language-model-gateway-improvements`; move to `implemented/` once merged to `main`.
 
 ## Implemented (shipped — see `plans/implemented/`)
 

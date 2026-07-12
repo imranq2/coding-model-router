@@ -46,7 +46,17 @@ python3 test-bedrock.py [--router-port 8771] [--model claude-sonnet-4-6]
 | File | Role |
 |---|---|
 | `install-model-router.sh` | Interactive installer — detects auth, picks model, installs venv, writes config, patches `~/.zshrc` |
-| `router.py` | FastAPI proxy — routes by model name, handles auth strategies, translates OpenAI↔Anthropic wire formats |
+| `router.py` | FastAPI app + request orchestration — routes by model name, dispatches by auth strategy. Supporting logic lives in the sibling modules below. |
+| `constants.py` | Shared regexes, header allowlists, retry/backoff tuning constants |
+| `tool_sanitizer.py` | vllm-mlx tool-name sanitization (local routes only) |
+| `aws_auth.py` | SigV4 signing for Bedrock (`_sign_bedrock`, `_SigV4Auth`) |
+| `bedrock_client.py` | Bedrock dispatch pacing, throttle detection, retry-with-backoff |
+| `route_config.py` | Route loading + lookup, including `claude_model_pattern` regex fallback |
+| `message_translator.py` | Anthropic↔OpenAI request/response translation |
+| `tokenizer.py` | HuggingFace tokenizer loading + exact token counting (Bedrock/Qwen routes with `tokenizer_model` configured) |
+| `context_manager.py` | Preflight context-budget enforcement: tool-result compression + oldest-message dropping |
+| `usage_stats.py` | Cumulative token stats + the stdout "savings ticker" |
+| `stream_converter.py` | SSE streaming translation (OpenAI SDK stream → Anthropic SSE) and Anthropic-passthrough streaming (tool-name restoration, `<think>` stripping) |
 | `models.json` | Model catalog — context windows, RAM thresholds, Bedrock IDs, tier defaults. Edit here; re-run installer to apply. |
 | `start-model-router.sh` | Launches vllm-mlx (optional) then router.py; waits for vllm-mlx readiness before starting router |
 | `stop-model-router.sh` | Kills running processes by PID file |
@@ -123,12 +133,13 @@ The shell function sets several `CLAUDE_CODE_*` vars that control how Claude Cod
 
 ### How the router enforces max_tokens
 
-Claude Code sends `max_tokens=128000` in every request (result of `min(200000, 128000)`). The router then applies two caps before the request reaches Bedrock:
+Claude Code sends `max_tokens=128000` in every request (result of `min(200000, 128000)`). The router uses one of two mutually-exclusive strategies, chosen per-route:
 
-1. **Dynamic context cap** — estimates input token count from character length, subtracts from `context_window` (262144 for Qwen), and caps `max_tokens` to the remainder. Prevents Bedrock from rejecting the request for context overflow.
-2. **Route ceiling** — hard cap from `router_config.json` (`max_tokens: 65536` for sonnet, `32768` for haiku). Matches the model's actual output limit.
+**Strategy A — tokenizer-based (routes with `tokenizer_model` configured):** translates the request to OpenAI format, counts exact tokens via the model's own HuggingFace tokenizer + chat template (`tokenizer.py`), and if over `backend_max_context_tokens - reserved_output_tokens - tokenizer_safety_margin`, compresses oversized tool results (head+tail truncation) and drops oldest message groups until it fits (`context_manager.py`), before ever sending the request upstream.
 
-Effective max output per turn = `min(route_ceiling, remaining_context_after_input)`.
+**Strategy B — character-heuristic (all other routes, including local/vllm-mlx):** estimates input token count from character length (4 chars ≈ 1 token, 1.20× safety multiplier), subtracts from `context_window`, and caps `max_tokens` to the remainder, minus a fixed `_TOKEN_ESTIMATE_SAFETY_BUFFER` (100 tokens) to absorb estimation imprecision on dense content like JSON/tool schemas.
+
+Both strategies are additionally bounded by the model's actual output limit, but via different mechanisms: Strategy B explicitly checks `route_max_tokens` (`router_config.json`'s `max_tokens` field, e.g. `65536` for sonnet, `32768` for haiku) as a ceiling. Strategy A instead caps `max_tokens` to `reserved_output_tokens` inside `enforce_context_budget` — this lands at the same ceiling only because the installer derives `reserved_output_tokens` from the model's `max_output_tokens` (see `install-model-router.sh`'s `build_route()`); a hand-edited config that sets `reserved_output_tokens` above the true output ceiling would not be caught by Strategy A the way Strategy B's explicit check would catch an equivalent misconfiguration. A reactive halving-retry loop (below) remains as a last-resort safety net for streaming `api_type: "openai"` routes (covers both strategies there, since it fires on the translated Bedrock response regardless of which one prepared the request). Non-streaming OpenAI requests get throttle-retry only, no overflow halving; local/Anthropic-passthrough/Anthropic-format-Bedrock routes rely on the dynamic cap alone — `_send_with_bedrock_retry` retries only on throttling, never on context overflow.
 
 ### Tokenizer drift
 
@@ -141,6 +152,13 @@ Qwen uses BPE tokenization; Anthropic uses its own tokenizer. The same content t
 ### Context overflow retry loop
 
 If Bedrock rejects with a context overflow error despite the dynamic cap, `router.py` retries up to 4 times, halving `max_tokens` each attempt. The dynamic cap pre-seeds `max_tokens` close to the working value so retries converge quickly rather than starting from 128K.
+
+### Route config schema additions
+
+Two new optional route fields (see `router.py`'s module docstring for the full list):
+
+- `claude_model_pattern` — regex checked on an exact `claude_model` lookup miss, so a route keeps matching future Claude Code model-id version bumps (e.g. `claude-sonnet-4-6` → `claude-sonnet-5`) without a `models.json` edit + reinstall.
+- `tokenizer_model` / `backend_max_context_tokens` / `reserved_output_tokens` / `tokenizer_safety_margin` — activate Strategy A (above) for a route. `tokenizer_model` and `tokenizer_safety_margin` are set directly on the two Qwen Bedrock entries in `models.json`; `backend_max_context_tokens` and `reserved_output_tokens` are derived by the installer from those entries' `context_window`/`max_output_tokens` and written into the generated `router_config.json`.
 
 ### Comparison with plain `claude` (Anthropic direct)
 

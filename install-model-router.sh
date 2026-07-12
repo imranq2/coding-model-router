@@ -64,9 +64,11 @@ else
 fi
 MODELS_CONFIG="${SCRIPT_DIR:+$SCRIPT_DIR/}models.json"
 
-# GitHub repo for fetching additional files when run via curl
+# GitHub repo for fetching additional files when run via curl. Override GITHUB_BRANCH via
+# MODEL_ROUTER_GITHUB_REF (e.g. a PR's head SHA) to bootstrap from unmerged commits — used by
+# the CI smoke tests, which otherwise download the bundle from main and can't see PR-only files.
 GITHUB_REPO="imranq2/coding-model-router"
-GITHUB_BRANCH="main"
+GITHUB_BRANCH="${MODEL_ROUTER_GITHUB_REF:-main}"
 
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" != "$DIR" ]; then
   # Detect if we're running via curl/stdin: SCRIPT_DIR is empty, or the files don't actually
@@ -77,7 +79,7 @@ if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" != "$DIR" ]; then
     mkdir -p "$DIR"
 
     # Download each required file from GitHub
-    for file in install-model-router.sh start-model-router.sh stop-model-router.sh uninstall-model-router.sh router.py models.json mcp-local.json; do
+    for file in install-model-router.sh start-model-router.sh stop-model-router.sh uninstall-model-router.sh router.py constants.py tool_sanitizer.py aws_auth.py bedrock_client.py route_config.py message_translator.py tokenizer.py context_manager.py usage_stats.py stream_converter.py models.json mcp-local.json; do
       echo "  Fetching $file..."
       if ! curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/$file" -o "$DIR/$file"; then
         echo "ERROR: Failed to download $file" >&2
@@ -101,7 +103,7 @@ if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" != "$DIR" ]; then
   else
     diag "bootstrap path: local bundle → copying from $SCRIPT_DIR"
     echo "[0/6] Copying script bundle to $DIR ..."
-    cp "$SCRIPT_DIR/"*.sh "$SCRIPT_DIR/router.py" "$SCRIPT_DIR/models.json" "$SCRIPT_DIR/mcp-local.json" "$DIR/"
+    cp "$SCRIPT_DIR/"*.sh "$SCRIPT_DIR/router.py" "$SCRIPT_DIR/constants.py" "$SCRIPT_DIR/tool_sanitizer.py" "$SCRIPT_DIR/aws_auth.py" "$SCRIPT_DIR/bedrock_client.py" "$SCRIPT_DIR/route_config.py" "$SCRIPT_DIR/message_translator.py" "$SCRIPT_DIR/tokenizer.py" "$SCRIPT_DIR/context_manager.py" "$SCRIPT_DIR/usage_stats.py" "$SCRIPT_DIR/stream_converter.py" "$SCRIPT_DIR/models.json" "$SCRIPT_DIR/mcp-local.json" "$DIR/"
     # The .whl is tracked in git but guard against a shallow clone / manual extraction.
     [ -f "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" ] && \
       cp "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" "$DIR/"
@@ -329,6 +331,8 @@ for i, m in enumerate(bm):
     print(f"BEDROCK_APITYPE_{k}={shq(m.get('api_type', 'anthropic'))}")
     p = m.get('price_per_mtok', 0)
     print(f"BEDROCK_PRICE_{k}={p}")
+    print(f"BEDROCK_TOKENIZER_{k}={shq(m.get('tokenizer_model') or '')}")
+    print(f"BEDROCK_MARGIN_{k}={m.get('tokenizer_safety_margin', 4096)}")
 
 for m in d.get('anthropic_models', []):
     t = m['tier'].upper()
@@ -339,6 +343,7 @@ for m in d.get('anthropic_models', []):
         print(f"ANTHROPIC_MAXOUT_{vk(m['id'])}={v}")
     p = m.get('price_per_mtok', 0)
     print(f"TIER_PRICE_{t}={p}")
+    print(f"TIER_PATTERN_{t}={shq(m.get('claude_model_pattern') or '')}")
 
 for tier, val in d.get('defaults', {}).get('tier_backends', {}).items():
     T = tier.upper()
@@ -476,6 +481,21 @@ bedrock_model_price() {  # price per million tokens for a Bedrock model id; 0 if
 tier_price() {  # price per million tokens for an Anthropic tier (haiku/sonnet/opus/fable); 0 if unknown
   local T; T="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
   eval "printf '%s' \"\${TIER_PRICE_${T}:-0}\""
+}
+
+bedrock_model_tokenizer() {  # HF tokenizer id for a Bedrock model; empty if not configured
+  local k; k="$(_model_key "$1")"
+  eval "printf '%s' \"\${BEDROCK_TOKENIZER_${k}:-}\""
+}
+
+bedrock_model_margin() {  # tokenizer safety margin (tokens) for a Bedrock model; 4096 if unset
+  local k; k="$(_model_key "$1")"
+  eval "printf '%s' \"\${BEDROCK_MARGIN_${k}:-4096}\""
+}
+
+tier_pattern() {  # claude_model_pattern regex for an Anthropic tier; empty if unknown
+  local T; T="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  eval "printf '%s' \"\${TIER_PATTERN_${T}:-}\""
 }
 
 anthropic_model_max_output() {  # max output tokens for an Anthropic model id; empty if unknown
@@ -948,7 +968,7 @@ if [ "${USE_LOCAL_MODELS}" = "1" ]; then
   [ -x "$VENV/bin/python" ] || "$PYBIN" -m venv "$VENV"
   echo "  venv Python: $("$VENV/bin/python" --version 2>&1) (from $PYBIN)"
   "$VENV/bin/python" -m pip install -q --upgrade pip
-  _extra_pip=""; any_bedrock && _extra_pip="boto3 openai"
+  _extra_pip=""; any_bedrock && _extra_pip="boto3 openai transformers"
   # shellcheck disable=SC2086
   if [ -f "$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl" ]; then
     VLLM_MLX_REPO="$SCRIPT_DIR/vllm_mlx-0.4.0-py3-none-any.whl"
@@ -966,7 +986,7 @@ else
   echo "  venv Python: $("$VENV/bin/python" --version 2>&1) (from $PYBIN)"
   "$VENV/bin/python" -m pip install -q --upgrade pip
   # shellcheck disable=SC2086
-  _extra_pip=""; any_bedrock && _extra_pip="boto3 openai"
+  _extra_pip=""; any_bedrock && _extra_pip="boto3 openai transformers"
   "$VENV/bin/python" -m pip install -q \
     "fastapi>=0.111" "uvicorn[standard]>=0.29" "httpx>=0.27" \
     $_extra_pip
@@ -988,13 +1008,20 @@ mkdir -p "$HOME/model-router"
 # Types: "local" (vllm-mlx), "bedrock" (Bedrock Mantle + SigV4), "anthropic" (direct passthrough).
 build_route() {
   # $1=tier(haiku|sonnet|opus|fable)  $2=claude_model_name
-  # Config shape: {tier, claude_model, url, model, auth}
+  # Config shape: {tier, claude_model, claude_model_pattern, url, model, auth}
   #   url   — full upstream endpoint (explicit, no construction in router)
   #   model — upstream model name (replaces claude_model in request body)
   #   auth  — none | passthrough | aws
+  #   claude_model_pattern — optional regex; lets the route keep matching future
+  #     Claude Code model-id version bumps without a config edit (see route_config.py).
   local be bid tier_name="$1" claude_model="$2"
   be="$(tier_backend "$1")"
   bid="$(tier_bedrock "$1")"
+
+  local _pattern; _pattern="$(tier_pattern "$tier_name")"
+  local _cmp=""
+  [ -n "$_pattern" ] && _cmp=", \"claude_model_pattern\": \"$_pattern\""
+
   if [ "$be" = "local" ]; then
     # max_tokens: written into the route so the router raises Claude Code's conservative cap
     # to the local model's actual context window. Omitted when the user chose "none" (vllm-mlx
@@ -1007,11 +1034,11 @@ build_route() {
       _ctk=', "chat_template_kwargs": {"enable_thinking": false}'
     fi
     if [ "$MLX_MAX_TOKENS" = "none" ]; then
-      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "price_per_mtok": 0%s}' \
-        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$_ctk"
+      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "price_per_mtok": 0%s%s}' \
+        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$_ctk" "$_cmp"
     else
-      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "max_tokens": %s, "price_per_mtok": 0%s}' \
-        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$MLX_MAX_TOKENS" "$_ctk"
+      printf '    {"tier": "%s", "claude_model": "%s", "url": "http://localhost:%s/v1/messages", "model": "%s", "auth": "none", "max_tokens": %s, "price_per_mtok": 0%s%s}' \
+        "$tier_name" "$claude_model" "$MLX_PORT" "$MODEL_ID" "$MLX_MAX_TOKENS" "$_ctk" "$_cmp"
     fi
   elif [ "$be" = "bedrock" ]; then
     # Qwen models (prefix "qwen.") use the OpenAI Chat Completions wire format on Bedrock Mantle;
@@ -1025,22 +1052,30 @@ build_route() {
     # For Qwen models, include context_window for dynamic token calculation
     # and max_tokens to override Claude Code's conservative 8K cap
     if printf '%s' "$bid" | grep -qi '^qwen'; then
+      # tokenizer_model enables Strategy A (preflight compression via context_manager.py)
+      # instead of the character-heuristic Strategy B — see router.py docstring.
+      local _btok; _btok="$(bedrock_model_tokenizer "$bid")"
+      local _tok_json=""
+      if [ -n "$_btok" ] && [ -n "$_bctx" ] && [ -n "$_bmaxout" ]; then
+        local _bmargin; _bmargin="$(bedrock_model_margin "$bid")"
+        _tok_json=", \"tokenizer_model\": \"$_btok\", \"backend_max_context_tokens\": $_bctx, \"reserved_output_tokens\": $_bmaxout, \"tokenizer_safety_margin\": $_bmargin"
+      fi
       if [ -n "$_bctx" ]; then
-        printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s, "context_window": %s, "max_tokens": %s}' \
-          "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_bctx" "$_bmaxout"
+        printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s, "context_window": %s, "max_tokens": %s%s%s}' \
+          "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_bctx" "$_bmaxout" "$_tok_json" "$_cmp"
       else
-        printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s, "max_tokens": %s}' \
-          "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_bmaxout"
+        printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/v1/chat/completions", "model": "%s", "auth": "aws", "aws_region": "%s", "api_type": "openai", "price_per_mtok": %s, "max_tokens": %s%s}' \
+          "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_bmaxout" "$_cmp"
       fi
     else
-      printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/anthropic/v1/messages", "model": "%s", "auth": "aws", "aws_region": "%s", "price_per_mtok": %s}' \
-        "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice"
+      printf '    {"tier": "%s", "claude_model": "%s", "url": "https://bedrock-mantle.%s.api.aws/anthropic/v1/messages", "model": "%s", "auth": "aws", "aws_region": "%s", "price_per_mtok": %s%s}' \
+        "$tier_name" "$claude_model" "$AWS_REGION" "$bid" "$AWS_REGION" "$_bprice" "$_cmp"
     fi
   else
     # anthropic — passthrough Authorization header from Claude Code.
     local _aprice; _aprice="$(tier_price "$tier_name")"
-    printf '    {"tier": "%s", "claude_model": "%s", "url": "https://api.anthropic.com/v1/messages", "model": "%s", "auth": "passthrough", "price_per_mtok": %s}' \
-      "$tier_name" "$claude_model" "$claude_model" "$_aprice"
+    printf '    {"tier": "%s", "claude_model": "%s", "url": "https://api.anthropic.com/v1/messages", "model": "%s", "auth": "passthrough", "price_per_mtok": %s%s}' \
+      "$tier_name" "$claude_model" "$claude_model" "$_aprice" "$_cmp"
   fi
 }
 

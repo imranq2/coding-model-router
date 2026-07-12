@@ -88,6 +88,8 @@
       "max_output_tokens": 32768,
       "api_type":         "openai",
       "price_per_mtok":   0.15,
+      "tokenizer_model":  "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "tokenizer_safety_margin": 4096,
       "reason":           "Best Bedrock coding model (default)"
     },
     {
@@ -96,6 +98,8 @@
       "max_output_tokens": 65536,
       "api_type":         "openai",
       "price_per_mtok":   0.50,
+      "tokenizer_model":  "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "tokenizer_safety_margin": 4096,
       "reason":           "Next-gen Qwen Coder on Bedrock"
     },
     {
@@ -117,10 +121,10 @@
   ],
 
   "anthropic_models": [
-    {"tier": "haiku",  "id": "claude-haiku-4-5-20251001", "max_output_tokens": null,  "price_per_mtok": 1.0},
-    {"tier": "sonnet", "id": "claude-sonnet-4-6",          "max_output_tokens": null,  "price_per_mtok": 3.0},
-    {"tier": "opus",   "id": "claude-opus-4-8",            "max_output_tokens": 65536, "price_per_mtok": 5.0},
-    {"tier": "fable",  "id": "claude-fable-5",             "max_output_tokens": 65536, "price_per_mtok": 10.0}
+    {"tier": "haiku",  "id": "claude-haiku-4-5-20251001", "claude_model_pattern": "^claude-haiku-",      "max_output_tokens": null,  "price_per_mtok": 1.0},
+    {"tier": "sonnet", "id": "claude-sonnet-4-6",          "claude_model_pattern": "^claude-sonnet(-|$)", "max_output_tokens": null,  "price_per_mtok": 3.0},
+    {"tier": "opus",   "id": "claude-opus-4-8",            "claude_model_pattern": "^claude-opus-",       "max_output_tokens": 65536, "price_per_mtok": 5.0},
+    {"tier": "fable",  "id": "claude-fable-5",             "claude_model_pattern": "^claude-fable-",      "max_output_tokens": 65536, "price_per_mtok": 10.0}
   ],
 
   "defaults": {

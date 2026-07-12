@@ -54,6 +54,22 @@ Optional fields:
   chat_template_kwargs  Extra kwargs passed to the tokenizer's apply_chat_template.
                         For Qwen3 local routes: {"enable_thinking": false} disables
                         the reasoning chain, preventing slow "Thinking Process:" output.
+  claude_model_pattern  Regex checked on an exact claude_model lookup miss, so a
+                        route keeps matching future Claude Code model-id version
+                        bumps (e.g. "^claude-sonnet(-|$)") without a config edit.
+  tokenizer_model       HuggingFace tokenizer id (e.g. "Qwen/Qwen3-Coder-30B-A3B-Instruct").
+                        When set on an api_type: "openai" route, enables Strategy A —
+                        exact token counting + preflight compression (context_manager.py)
+                        instead of the character-heuristic (Strategy B).
+  backend_max_context_tokens / reserved_output_tokens / tokenizer_safety_margin
+                        Strategy A budget inputs — see context_manager.py docstring.
+
+MODULE LAYOUT
+-------------
+This file is the FastAPI app + request orchestration only. Supporting logic lives
+in sibling modules: constants.py, tool_sanitizer.py, aws_auth.py, bedrock_client.py,
+route_config.py, message_translator.py, tokenizer.py, context_manager.py,
+usage_stats.py, stream_converter.py.
 
 EXAMPLE CONFIG
 --------------
@@ -98,19 +114,39 @@ suppression mechanisms, one for each code path:
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import inspect
 import json
 import logging
 import os
-import random
 import re
 import sys
 from pathlib import Path
-from typing import AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from aws_auth import _SigV4Auth, _sign_bedrock
+from bedrock_client import _is_throttling_status, _send_with_bedrock_retry, _throttle_backoff_seconds
+from constants import (
+    _ANTHROPIC_ONLY_HEADERS,
+    _CONTEXT_OVERFLOW_RE,
+    _HOP_BY_HOP,
+    _MAX_THROTTLE_RETRIES,
+    _SKIP_HEADERS,
+    _TOKEN_ESTIMATE_SAFETY_BUFFER,
+)
+from context_manager import enforce_context_budget
+from message_translator import (
+    _anthropic_to_openai_request,
+    _estimate_input_tokens,
+    _openai_to_anthropic_response,
+)
+from route_config import CONFIG_PATH, ROUTES, find_route
+from stream_converter import _msg_id, _oai_stream_with_cleanup, _sse_event, _stream_logging
+from tokenizer import count_oai_request_tokens
+from tool_sanitizer import _sanitize_tools
+from usage_stats import _record_tokens
 
 # Logs go to stderr — start-model-router.sh redirects stderr to the log file.
 # stdout is reserved for the live status line only.
@@ -122,446 +158,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("model-router")
 
-_STDOUT_IS_TTY = sys.stdout.isatty()
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-CONFIG_PATH = Path(
-    os.environ.get("ROUTER_CONFIG", Path.home() / "model-router" / "router_config.json")
-)
-
-
-def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
-
-
-try:
-    CONFIG: dict = load_config()
-except FileNotFoundError:
-    log.error(
-        "[model-router] config not found at %s — run install-model-router first; starting with no routes",
-        CONFIG_PATH,
-    )
-    CONFIG = {"routes": []}
-
-# Key routes by claude_model (what Claude Code sends) for O(1) lookup.
-# Warn on duplicates rather than silently dropping earlier entries.
-ROUTES: dict[str, dict] = {}
-for _r in CONFIG.get("routes", []):
-    _key = _r["claude_model"]
-    if _key in ROUTES:
-        log.warning("[model-router] duplicate route for model '%s' — later entry wins", _key)
-    ROUTES[_key] = _r
-
-
-def find_route(model: str) -> dict | None:
-    return ROUTES.get(model)
-
-
-# Reference price for savings comparison — read from the opus route in config, fallback to $5/MTok.
-_OPUS_PRICE_PER_MTOK: float = next(
-    (float(r.get("price_per_mtok", 5.0)) for r in CONFIG.get("routes", []) if r.get("tier") == "opus"),
-    5.0,
-)
-
-
-# ---------------------------------------------------------------------------
-# Tool name sanitization for local (vllm-mlx) routes
-# ---------------------------------------------------------------------------
-
-_VALID_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
-def _sanitize_tool_name(name: str) -> str:
-    """Map an arbitrary tool name to one that satisfies ^[A-Za-z0-9_-]{1,64}$."""
-    sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", name)
-    if len(sanitized) <= 64:
-        return sanitized
-    # Stable 64-char form: first 55 chars + '_' + 8-char SHA-256 prefix
-    h = hashlib.sha256(name.encode()).hexdigest()[:8]
-    return sanitized[:55] + "_" + h
-
-
-def _sanitize_tools(body_json: dict) -> tuple[dict, dict]:
-    """Sanitize tool names for vllm-mlx's [A-Za-z0-9_-]{1,64} constraint.
-
-    Returns (modified_body_json, {sanitized_name: original_name}).
-    Only entries that needed sanitization appear in the map.
-    """
-    tools = body_json.get("tools")
-    if not tools:
-        return body_json, {}
-
-    mapping: dict[str, str] = {}
-    new_tools: list = []
-    used: set[str] = set()
-
-    for tool in tools:
-        original_name = tool.get("name", "")
-        if _VALID_TOOL_NAME_RE.match(original_name):
-            new_tools.append(tool)
-            used.add(original_name)
-        else:
-            sanitized = _sanitize_tool_name(original_name)
-            base, i = sanitized, 1
-            while sanitized in used:
-                suffix = f"_{i}"
-                sanitized = base[: 64 - len(suffix)] + suffix
-                i += 1
-            used.add(sanitized)
-            mapping[sanitized] = original_name
-            new_tools.append({**tool, "name": sanitized})
-
-    if not mapping:
-        return body_json, {}
-    return {**body_json, "tools": new_tools}, mapping
-
-
-# ---------------------------------------------------------------------------
-# SigV4 signing for Bedrock Mantle
-# ---------------------------------------------------------------------------
-
-
-def _sign_bedrock(url: str, body: bytes, route: dict) -> dict:
-    """Return a headers dict with AWS SigV4 Authorization for a Bedrock POST."""
-    import boto3
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-
-    # Profile comes from AWS_PROFILE env var (set in the user's shell before starting the router).
-    # Not stored in router_config.json so the config is shareable without exposing profile names.
-    profile = os.environ.get("AWS_PROFILE")
-    region = route.get("aws_region", "us-east-1")
-
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    creds = session.get_credentials().get_frozen_credentials()
-    req = AWSRequest(
-        method="POST",
-        url=url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    SigV4Auth(creds, "bedrock", region).add_auth(req)
-    return dict(req.headers)
-
-
-# ---------------------------------------------------------------------------
-# SigV4 httpx.Auth — applied per-request by the openai SDK's underlying transport
-# ---------------------------------------------------------------------------
-
-
-class _SigV4Auth(httpx.Auth):
-    """Apply AWS SigV4 signing to every request the openai SDK makes.
-
-    httpx calls auth_flow synchronously before each send. At that point the
-    openai SDK has already serialised the body to bytes, so request.content is
-    available for body-hash computation.
-    """
-
-    def __init__(self, route: dict) -> None:
-        self._route = route
-
-    def auth_flow(self, request: httpx.Request):
-        signed = _sign_bedrock(str(request.url), request.content, self._route)
-        for k, v in signed.items():
-            request.headers[k.lower()] = v
-        yield request
-
-
-# ---------------------------------------------------------------------------
-# Retry/backoff for Bedrock throttling
-# ---------------------------------------------------------------------------
-#
-# Bedrock's on-demand ("Mantle") endpoints scale capacity gradually rather than
-# instantly — a request rate that ramps up faster than the endpoint can scale
-# (roughly, more than doubling within a ~30 minute window) gets rejected with a
-# throttling error even though the account is nowhere near its steady-state
-# quota. This is transient: retrying with backoff almost always succeeds once
-# Bedrock's autoscaler catches up, so these are retried separately from the
-# context-overflow retry loop above, which handles a different, non-transient
-# error.
-
-# Bedrock dispatch rate gate — prevents on-demand capacity 503s at the source.
-# Bedrock's autoscaler rejects traffic that ramps faster than ~2x per 30 min,
-# so bursts (e.g. parallel tool calls after an idle period) trigger 503s.
-# Enforcing a minimum gap between consecutive dispatches smooths these bursts
-# without blocking concurrent in-flight streams (lock released immediately
-# after the timestamp update, before the actual HTTP send).
-_BEDROCK_MIN_DISPATCH_INTERVAL_S = 0.3  # ≤ ~3 new Bedrock dispatches/sec
-_bedrock_dispatch_lock = asyncio.Lock()
-_bedrock_last_dispatch: float = 0.0  # asyncio monotonic time of last dispatch
-
-
-async def _pace_bedrock_dispatch() -> None:
-    global _bedrock_last_dispatch
-    async with _bedrock_dispatch_lock:
-        loop = asyncio.get_running_loop()
-        wait = _BEDROCK_MIN_DISPATCH_INTERVAL_S - (loop.time() - _bedrock_last_dispatch)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _bedrock_last_dispatch = asyncio.get_running_loop().time()
-
-
-_MAX_THROTTLE_RETRIES = 5
-_THROTTLE_BASE_DELAY_S = 1.0
-_THROTTLE_MAX_DELAY_S = 20.0
-
-_THROTTLE_TEXT_RE = re.compile(
-    r"throttl|too many requests|rate.?limit|try again later"
-    r"|increase.*traffic|traffic.*increase"
-    r"|on.?demand.capacity|exceed.*capacity|double faster",
-    re.IGNORECASE,
-)
-
-# Matches Bedrock's context-window overflow error. Defined at module level so
-# _is_throttling_status can explicitly exclude it — context overflow is a
-# deterministic failure (input too large) that requires modifying the request,
-# not a transient server-side error that resolves on retry.
-_CONTEXT_OVERFLOW_RE = re.compile(r"contains at least (\d+) input tokens", re.IGNORECASE)
-
-
-def _throttle_backoff_seconds(attempt: int) -> float:
-    """Exponential backoff with full jitter (attempt is 0-indexed)."""
-    ceiling = min(_THROTTLE_MAX_DELAY_S, _THROTTLE_BASE_DELAY_S * (2**attempt))
-    return random.uniform(ceiling / 2, ceiling)
-
-
-def _is_throttling_status(status_code: int, body_text: str = "") -> bool:
-    """True only for transient Bedrock/AWS throttling responses worth blind-retrying.
-
-    Explicitly excludes context-window overflow (deterministic — retrying the same
-    request without modifying max_tokens will always fail again).
-    """
-    if _CONTEXT_OVERFLOW_RE.search(body_text or ""):
-        return False  # not transient — caller must reduce max_tokens before retrying
-    if status_code == 429:
-        return True
-    if status_code >= 400 and _THROTTLE_TEXT_RE.search(body_text or ""):
-        return True
-    return False
-
-
-async def _send_with_bedrock_retry(
-    client: httpx.AsyncClient,
-    target_url: str,
-    upstream_headers: dict,
-    raw_body: bytes,
-    route: dict,
-    auth: str,
-) -> httpx.Response:
-    """POST to target_url, retrying on Bedrock throttling with backoff + re-signed headers.
-
-    Only retries when auth == "aws" (Bedrock's on-demand endpoints are the ones that
-    throttle when request rate ramps too fast — see module note above). Other backends
-    (local, Anthropic passthrough) are sent once, unchanged, exactly as before.
-    """
-    attempt = 0
-    while True:
-        if auth == "aws":
-            await _pace_bedrock_dispatch()
-        upstream_req = client.build_request(
-            "POST", target_url, headers=upstream_headers, content=raw_body
-        )
-        resp = await client.send(upstream_req, stream=True)
-
-        if auth != "aws" or resp.status_code < 400 or attempt >= _MAX_THROTTLE_RETRIES:
-            return resp
-
-        error_body = await resp.aread()
-        await resp.aclose()
-        error_text = error_body.decode("utf-8", errors="replace")
-
-        if not _is_throttling_status(resp.status_code, error_text):
-            # Not a throttling error — hand back an in-memory Response carrying the
-            # already-drained body so the caller's existing error-handling path
-            # (which also calls .aread()) works unchanged.
-            return httpx.Response(
-                status_code=resp.status_code, headers=resp.headers, content=error_body
-            )
-
-        delay = _throttle_backoff_seconds(attempt)
-        attempt += 1
-        log.warning(
-            "[model-router] Bedrock throttled (attempt %d/%d): backing off %.1fs — %s",
-            attempt, _MAX_THROTTLE_RETRIES, delay, error_text[:200],
-        )
-        await asyncio.sleep(delay)
-        # SigV4 signatures are time-scoped (~15 min skew tolerance) — re-sign before
-        # retrying rather than reusing a signature computed before the backoff sleep.
-        sig_headers = {k.lower(): v for k, v in _sign_bedrock(target_url, raw_body, route).items()}
-        upstream_headers = {**upstream_headers, **sig_headers}
-
-
-# ---------------------------------------------------------------------------
-# OpenAI <-> Anthropic translation (for api_type: "openai" routes)
-# ---------------------------------------------------------------------------
-
-# finish_reason/stop_reason mappings
-_OAI_TO_ANT_STOP = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
-
-
-class _ThinkingStripper:
-    """Strip <think>…</think> blocks from streamed output on Bedrock OpenAI routes.
-
-    Used only for api_type="openai" routes where the model has already generated
-    thinking tokens — see "THINKING SUPPRESSION" in the module docstring for why
-    this path exists alongside the chat_template_kwargs approach for local routes.
-
-    Processes text incrementally so tag boundaries that fall mid-chunk are handled
-    correctly across multiple feed() calls.
-    """
-
-    _OPEN = "<think>"
-    _CLOSE = "</think>"
-
-    def __init__(self) -> None:
-        self._buf = ""
-        self._inside = False
-
-    def feed(self, text: str) -> str:
-        """Return the visible portion of *text* (thinking content is discarded)."""
-        self._buf += text
-        out: list[str] = []
-
-        while True:
-            if self._inside:
-                end = self._buf.find(self._CLOSE)
-                if end == -1:
-                    self._buf = ""  # still inside thinking block — discard
-                    break
-                self._inside = False
-                self._buf = self._buf[end + len(self._CLOSE):]
-                if self._buf.startswith("\n"):  # drop the newline that typically follows </think>
-                    self._buf = self._buf[1:]
-            else:
-                start = self._buf.find(self._OPEN)
-                if start == -1:
-                    # No open tag — safe to forward up to the point where a partial
-                    # tag prefix could be hiding at the very end of the buffer.
-                    safe = self._safe_forward_len()
-                    out.append(self._buf[:safe])
-                    self._buf = self._buf[safe:]
-                    break
-                out.append(self._buf[:start])
-                self._inside = True
-                self._buf = self._buf[start + len(self._OPEN):]
-
-        return "".join(out)
-
-    def flush(self) -> str:
-        """Return any buffered visible content at stream end.
-
-        Content held back because it might be the start of a <think> tag is
-        safe to forward once the stream is done (a partial tag cannot be completed).
-        If the stream ended mid-think the buffered thinking content is discarded.
-        """
-        if self._inside:
-            self._buf = ""
-            self._inside = False
-            return ""
-        result, self._buf = self._buf, ""
-        return result
-
-    def _safe_forward_len(self) -> int:
-        """Number of leading bytes in self._buf that are safe to forward now.
-
-        Holds back the shortest suffix that could still be a prefix of _OPEN so
-        we never emit a partial '<think' that will turn out to be a tag boundary.
-        """
-        tag = self._OPEN
-        for i in range(1, len(tag)):
-            if self._buf.endswith(tag[:i]):
-                return len(self._buf) - i
-        return len(self._buf)
-
-
-# Headers that are Anthropic-specific and must not be forwarded to OpenAI endpoints
-_ANTHROPIC_ONLY_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "x-api-key"})
-
-
-def _msg_id() -> str:
-    return "msg_" + os.urandom(12).hex()
-
-
-# Per-model cumulative token counters {upstream_model: {"input": int, "output": int, "price_per_mtok": float}}
-_token_stats: dict[str, dict] = {}
-
-# Maps tier names to short display labels used in the status line (e.g. "haiku" → "low").
-_TIER_LABEL = {"haiku": "low", "sonnet": "med", "opus": "high", "fable": "top"}
-_TIER_ORDER = ["low", "med", "high", "top"]
-
-
-def _record_tokens(upstream_model: str, in_tok: int, out_tok: int, price_per_mtok: float, backend_label: str, tier: str = "") -> None:
-    """Update cumulative stats and emit a compact status line.
-
-    Detailed per-model breakdown goes to the log file (stderr).
-    A one-line tier summary overwrites the current terminal line on stdout —
-    this is the "savings ticker" visible while Claude Code is running.
-    """
-    log.info(
-        "[model-router] tokens  in=%-6d out=%-6d backend=%-12s model=%s",
-        in_tok, out_tok, backend_label, upstream_model,
-    )
-    entry = _token_stats.setdefault(upstream_model, {"input": 0, "output": 0, "price_per_mtok": price_per_mtok, "tier": tier})
-    entry["input"] += in_tok
-    entry["output"] += out_tok
-    entry["price_per_mtok"] = price_per_mtok
-
-    # Detailed per-model totals → log file only
-    grand_total = sum(s["input"] + s["output"] for s in _token_stats.values())
-    grand_cost = sum((s["input"] + s["output"]) / 1_000_000 * s["price_per_mtok"] for s in _token_stats.values())
-    grand_opus_cost = grand_total / 1_000_000 * _OPUS_PRICE_PER_MTOK
-    log.info("[model-router] ── running totals ──────────────────────────────────────────────────")
-    for mdl, s in _token_stats.items():
-        mtok = s["input"] + s["output"]
-        pct = 100.0 * mtok / grand_total if grand_total else 0.0
-        cost = mtok / 1_000_000 * s["price_per_mtok"]
-        cost_str = "FREE    " if s["price_per_mtok"] == 0 else f"${cost:.4f}"
-        saved = mtok / 1_000_000 * (_OPUS_PRICE_PER_MTOK - s["price_per_mtok"])
-        saved_str = f"  saved ${saved:.4f}" if saved > 0 else ""
-        tier_label = _TIER_LABEL.get(s.get("tier", ""), s.get("tier", ""))
-        log.info("[model-router]   %-4s %-46s %8d tok  %5.1f%%  %s%s", tier_label, mdl[:46], mtok, pct, cost_str, saved_str)
-    total_saved = grand_opus_cost - grand_cost
-    log.info(
-        "[model-router]   %-4s %-46s %8d tok  100.0%%  $%.4f total  (saved $%.4f)",
-        "", "ALL MODELS", grand_total, grand_cost, total_saved,
-    )
-
-    # Compact tier summary → stdout, single updating line
-    by_tier: dict[str, dict] = {}
-    for s in _token_stats.values():
-        label = _TIER_LABEL.get(s.get("tier", ""), s.get("tier", "") or "?")
-        e = by_tier.setdefault(label, {"tokens": 0, "cost": 0.0, "saved": 0.0})
-        mtok2 = s["input"] + s["output"]
-        e["tokens"] += mtok2
-        e["cost"] += mtok2 / 1_000_000 * s["price_per_mtok"]
-        savings = mtok2 / 1_000_000 * (_OPUS_PRICE_PER_MTOK - s["price_per_mtok"])
-        if savings > 0:
-            e["saved"] += savings
-
-    parts = []
-    for label in _TIER_ORDER:
-        if label not in by_tier:
-            continue
-        e = by_tier[label]
-        cost_str = "FREE" if e["cost"] == 0 else f"${e['cost']:.4f}"
-        parts.append(f"{label}: {e['tokens']:,} tok {cost_str}")
-    total_saved2 = sum(e["saved"] for e in by_tier.values())
-    if total_saved2 > 0:
-        parts.append(f"saved: ${total_saved2:.4f}")
-    line = "  |  ".join(parts)
-    if _STDOUT_IS_TTY:
-        print(f"\033[2K\r{line}", end="", flush=True)
-    else:
-        print(line, flush=True)
-
-
-def _sse_event(event_type: str, data: dict) -> bytes:
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
-
 
 def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
     """Return the error text as a valid Anthropic assistant message (status 200).
@@ -569,8 +165,6 @@ def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
     Claude Code only shows text to the user when it receives a valid 200 response.
     HTTP 4xx/5xx are surfaced as opaque API errors with no actionable message.
     """
-    from fastapi.responses import JSONResponse, StreamingResponse
-
     msg_id = _msg_id()
     if not is_streaming:
         return JSONResponse({
@@ -610,399 +204,30 @@ def _error_as_assistant_message(text: str, model: str, is_streaming: bool):
     return StreamingResponse(_stream(), status_code=200, media_type="text/event-stream")
 
 
-def _anthropic_content_to_text(content) -> str:
-    """Flatten Anthropic content (str or list of blocks) to a plain string."""
-    if isinstance(content, str):
-        return content
-    return "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
-
-
-def _estimate_input_tokens(body_json: dict) -> int:
-    """Estimate input token count from Anthropic request body using character-based heuristic.
-
-    Uses the standard heuristic: ~4 characters ≈ 1 token for English text.
-    Counts all content: system, messages (text + tool_use + tool_result), and tool definitions.
+def _annotate_fallback_error(error_body: bytes, model: str) -> bytes:
+    """Prefix an upstream error with a note explaining that this request had no
+    configured route and went directly to Anthropic — without cost-routing or
+    context-budget enforcement. Without this, a fallback request that later hits
+    a real context-length error just looks like a bare, unexplained "context
+    exceeded" failure with no link back to the actual root cause (a missing/stale
+    route entry in models.json).
     """
-    total_chars = 0
-
-    # Count system prompt
-    if system := body_json.get("system"):
-        total_chars += len(_anthropic_content_to_text(system))
-
-    # Count all message content (text, tool_use, and tool_result blocks)
-    for msg in body_json.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                btype = block.get("type")
-                if btype == "text":
-                    total_chars += len(block.get("text", ""))
-                elif btype == "tool_use":
-                    total_chars += len(block.get("name", ""))
-                    inp = block.get("input")
-                    if inp:
-                        total_chars += len(json.dumps(inp))
-                elif btype == "tool_result":
-                    result_content = block.get("content", "")
-                    if isinstance(result_content, str):
-                        total_chars += len(result_content)
-                    elif isinstance(result_content, list):
-                        for rb in result_content:
-                            if rb.get("type") == "text":
-                                total_chars += len(rb.get("text", ""))
-
-    # Count tool definitions (name + description + input_schema)
-    for tool in body_json.get("tools", []):
-        total_chars += len(tool.get("name", ""))
-        total_chars += len(tool.get("description", ""))
-        schema = tool.get("input_schema") or tool.get("parameters") or {}
-        if schema:
-            total_chars += len(json.dumps(schema))
-
-    # Convert characters to tokens (4 chars ≈ 1 token), round up to be conservative
-    return (total_chars + 3) // 4
-
-
-def _anthropic_to_openai_request(body_json: dict) -> dict:
-    """Translate an Anthropic Messages API request body to OpenAI Chat Completions format."""
-    oai: dict = {"model": body_json["model"]}
-
-    for field in ("stream", "temperature", "top_p", "max_tokens"):
-        if field in body_json:
-            oai[field] = body_json[field]
-
-    messages: list = []
-
-    # System prompt — top-level in Anthropic, becomes role:system in OpenAI
-    if system := body_json.get("system"):
-        messages.append({"role": "system", "content": _anthropic_content_to_text(system)})
-
-    for msg in body_json.get("messages", []):
-        role = msg["role"]
-        content = msg["content"]
-
-        if role == "assistant":
-            if isinstance(content, list):
-                text_parts: list[str] = []
-                tool_calls: list[dict] = []
-                for block in content:
-                    btype = block.get("type")
-                    if btype == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif btype == "tool_use":
-                        tool_calls.append({
-                            "id": block.get("id", f"call_{len(tool_calls)}"),
-                            "type": "function",
-                            "function": {
-                                "name": block.get("name", ""),
-                                "arguments": json.dumps(block.get("input", {})),
-                            },
-                        })
-                oai_msg: dict = {"role": "assistant"}
-                if text_parts:
-                    oai_msg["content"] = "\n".join(text_parts)
-                if tool_calls:
-                    oai_msg["tool_calls"] = tool_calls
-                messages.append(oai_msg)
-            else:
-                messages.append({"role": "assistant", "content": content or ""})
-
-        elif role == "user":
-            if isinstance(content, list):
-                # tool_result blocks become separate role:tool messages.
-                # Non-tool-result blocks stay as role:user content.
-                pending: list = []
-                for block in content:
-                    if block.get("type") == "tool_result":
-                        # Flush any accumulated user content first
-                        if pending:
-                            messages.append({"role": "user", "content": _convert_user_content(pending)})
-                            pending = []
-                        result_content = block.get("content", "")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": block.get("tool_use_id", ""),
-                            "content": _anthropic_content_to_text(result_content) if isinstance(result_content, list) else str(result_content or ""),
-                        })
-                    else:
-                        pending.append(block)
-                if pending:
-                    messages.append({"role": "user", "content": _convert_user_content(pending)})
-            else:
-                messages.append({"role": "user", "content": content or ""})
-
-    oai["messages"] = messages
-
-    if tools := body_json.get("tools"):
-        oai["tools"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
-                },
-            }
-            for t in tools
-        ]
-
-    if tc := body_json.get("tool_choice"):
-        tc_type = tc.get("type")
-        if tc_type == "auto":
-            oai["tool_choice"] = "auto"
-        elif tc_type == "any":
-            oai["tool_choice"] = "required"
-        elif tc_type == "none":
-            oai["tool_choice"] = "none"
-        elif tc_type == "tool":
-            oai["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
-
-    return oai
-
-
-def _convert_user_content(blocks: list) -> str | list:
-    """Convert a list of non-tool-result Anthropic content blocks to OpenAI user content."""
-    text_only = all(b.get("type") == "text" for b in blocks)
-    if text_only:
-        return "\n".join(b.get("text", "") for b in blocks)
-    # Mixed content (e.g. images) — build OpenAI content array
-    result = []
-    for block in blocks:
-        btype = block.get("type")
-        if btype == "text":
-            result.append({"type": "text", "text": block.get("text", "")})
-        elif btype == "image":
-            src = block.get("source", {})
-            if src.get("type") == "base64":
-                url = f"data:{src.get('media_type', 'image/jpeg')};base64,{src.get('data', '')}"
-            else:
-                url = src.get("url", "")
-            result.append({"type": "image_url", "image_url": {"url": url}})
-    return result
-
-
-def _openai_to_anthropic_response(resp_json: dict, msg_id: str, upstream_model: str) -> dict:
-    """Translate a non-streaming OpenAI Chat Completions response to Anthropic format."""
-    usage = resp_json.get("usage", {})
-    content: list = []
-    stop_reason = "end_turn"
-
-    choices = resp_json.get("choices", [])
-    if choices:
-        choice = choices[0]
-        message = choice.get("message", {})
-        stop_reason = _OAI_TO_ANT_STOP.get(choice.get("finish_reason", "stop"), "end_turn")
-
-        if text := message.get("content"):
-            # Qwen3 reasoning models embed <think>…</think> in the content field.
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip("\n").strip()
-            if text:
-                content.append({"type": "text", "text": text})
-
-        for tc in message.get("tool_calls") or []:
-            fn = tc.get("function", {})
-            try:
-                input_data = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                input_data = {}
-            content.append({
-                "type": "tool_use",
-                "id": tc.get("id", f"toolu_{len(content):04x}"),
-                "name": fn.get("name", ""),
-                "input": input_data,
-            })
-
-    return {
-        "id": msg_id,
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": upstream_model,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-        },
-    }
-
-
-async def _stream_oai_sdk_to_anthropic(
-    stream,  # openai.AsyncStream[ChatCompletionChunk]
-    msg_id: str,
-    upstream_model: str,
-    backend_label: str = "BEDROCK",
-    price_per_mtok: float = 0.0,
-    tier: str = "",
-    first_chunk=None,  # pre-fetched chunk from peek-before-commit retry logic
-) -> AsyncGenerator[bytes, None]:
-    """Convert an openai SDK async stream to Anthropic SSE format.
-
-    Uses typed ChatCompletionChunk objects instead of raw SSE text, so there
-    is no manual JSON parsing — field access is via the SDK's dataclass attrs.
-    """
-    sent_message_start = False
-    open_blocks: dict[int, dict] = {}
-    next_idx = 0
-    text_idx: int | None = None
-    tool_idx_map: dict[int, int] = {}  # openai tool index → anthropic block index
-    finish_reason: str | None = None
-    input_tokens = 0
-    output_tokens = 0
-    thinking_stripper = _ThinkingStripper()
-
-    async def _iter_stream():
-        if first_chunk is not None:
-            yield first_chunk
-        async for chunk in stream:
-            yield chunk
-
+    note = (
+        f"[model-router] model '{model}' has no configured route — this request "
+        "went directly to Anthropic without cost-routing or context-budget "
+        "enforcement. Original error: "
+    )
     try:
-        async for chunk in _iter_stream():
-            if not sent_message_start:
-                sent_message_start = True
-                yield _sse_event("message_start", {
-                    "type": "message_start",
-                    "message": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": upstream_model,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 1},
-                    },
-                })
-                yield _sse_event("ping", {"type": "ping"})
-
-            for choice in chunk.choices:
-                delta = choice.delta
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-
-                if delta.content:
-                    visible = thinking_stripper.feed(delta.content)
-                    if visible:
-                        if text_idx is None:
-                            text_idx = next_idx
-                            next_idx += 1
-                            open_blocks[text_idx] = {"type": "text"}
-                            yield _sse_event("content_block_start", {
-                                "type": "content_block_start",
-                                "index": text_idx,
-                                "content_block": {"type": "text", "text": ""},
-                            })
-                        yield _sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": text_idx,
-                            "delta": {"type": "text_delta", "text": visible},
-                        })
-
-                for tc in delta.tool_calls or []:
-                    oai_tc_idx = tc.index
-                    if oai_tc_idx not in tool_idx_map:
-                        ant_idx = next_idx
-                        next_idx += 1
-                        tool_idx_map[oai_tc_idx] = ant_idx
-                        tc_id = tc.id or f"toolu_{ant_idx:04x}"
-                        tc_name = (tc.function.name if tc.function else "") or ""
-                        open_blocks[ant_idx] = {"type": "tool_use"}
-                        yield _sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": ant_idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tc_id,
-                                "name": tc_name,
-                                "input": {},
-                            },
-                        })
-                    ant_idx = tool_idx_map[oai_tc_idx]
-                    if tc.function and tc.function.arguments:
-                        yield _sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": ant_idx,
-                            "delta": {"type": "input_json_delta", "partial_json": tc.function.arguments},
-                        })
-
-            if chunk.usage:
-                if chunk.usage.prompt_tokens is not None:
-                    input_tokens = chunk.usage.prompt_tokens
-                if chunk.usage.completion_tokens is not None:
-                    output_tokens = chunk.usage.completion_tokens
-
-    except Exception as _exc:
-        log.error("[model-router] upstream stream error: %s", _exc)
-        _stream_error_msg = str(_exc)
-    else:
-        _stream_error_msg = None
-    finally:
-        await stream.close()
-
-    # Always emit proper SSE termination events — both on clean completion and after errors.
-    # If the stream yielded zero chunks (empty response or early error), synthesize message_start
-    # so what follows is a valid Anthropic SSE sequence.
-    if not sent_message_start:
-        yield _sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": upstream_model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            },
-        })
-        yield _sse_event("ping", {"type": "ping"})
-
-    # When the stream errored before producing any content, emit a visible error text block
-    # so the user knows what happened instead of receiving a silent empty response.
-    if _stream_error_msg and not sent_message_start:
-        yield _sse_event("content_block_start", {
-            "type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        })
-        yield _sse_event("content_block_delta", {
-            "type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": f"[model-router error] {_stream_error_msg}"},
-        })
-        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
-
-    # Flush any text the stripper held back waiting for a possible </think> continuation.
-    remaining = thinking_stripper.flush()
-    if remaining:
-        if text_idx is None:
-            text_idx = next_idx
-            next_idx += 1
-            open_blocks[text_idx] = {"type": "text"}
-            yield _sse_event("content_block_start", {
-                "type": "content_block_start",
-                "index": text_idx,
-                "content_block": {"type": "text", "text": ""},
-            })
-        yield _sse_event("content_block_delta", {
-            "type": "content_block_delta",
-            "index": text_idx,
-            "delta": {"type": "text_delta", "text": remaining},
-        })
-
-    for idx in sorted(open_blocks):
-        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": idx})
-
-    stop_reason = _OAI_TO_ANT_STOP.get(finish_reason or "stop", "end_turn")
-    yield _sse_event("message_delta", {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
-    })
-    yield _sse_event("message_stop", {"type": "message_stop"})
-    _record_tokens(upstream_model, input_tokens, output_tokens, price_per_mtok, backend_label, tier)
+        parsed = json.loads(error_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return note.encode() + error_body
+    if not isinstance(parsed, dict):
+        return note.encode() + error_body
+    error_obj = parsed.get("error")
+    if isinstance(error_obj, dict) and isinstance(error_obj.get("message"), str):
+        error_obj["message"] = note + error_obj["message"]
+        return json.dumps(parsed).encode()
+    return note.encode() + error_body
 
 
 # ---------------------------------------------------------------------------
@@ -1010,8 +235,6 @@ async def _stream_oai_sdk_to_anthropic(
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="model-router", docs_url=None, redoc_url=None)
-
-_SKIP_HEADERS = frozenset({"host", "content-length", "transfer-encoding", "authorization"})
 
 
 def _passthrough_headers(request: Request) -> dict:
@@ -1037,7 +260,9 @@ async def proxy_messages(request: Request) -> StreamingResponse:
 
     Flow:
       1. Route lookup    — find config for the requested model (fallback: Anthropic direct).
-      2. Body mutations  — rewrite model name, enforce max_tokens, sanitize tool names,
+      2. Body mutations  — rewrite model name, enforce context budget (Strategy A:
+                           tokenizer-based preflight compression, or Strategy B:
+                           character-heuristic dynamic cap), sanitize tool names,
                            inject chat_template_kwargs (local routes).
       3. Header building — auth strategy determines upstream Authorization header.
       4. Dispatch        — OpenAI routes use the openai SDK + Anthropic translation;
@@ -1048,12 +273,12 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     try:
         body_json = json.loads(raw_body)
     except json.JSONDecodeError:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     model = body_json.get("model", "")
     route = find_route(model)
+    is_fallback_route = route is None
+    request_id = _msg_id()
 
     # Suffix is "" for /v1/messages or "/count_tokens" for the count_tokens endpoint.
     req_suffix = request.url.path[len("/v1/messages"):]
@@ -1068,19 +293,27 @@ async def proxy_messages(request: Request) -> StreamingResponse:
 
     auth = route["auth"]
     api_type = route.get("api_type", "anthropic")
-    upstream_model = route["model"]
+    # Passthrough routes forward the client's exact model id — Anthropic is
+    # authoritative on which model ids exist, so a version-bumped id must never
+    # be silently overridden by a possibly-stale pinned config value. Bedrock/local
+    # routes DO rewrite to the configured backend model id, since that's a
+    # genuinely different upstream model, not just a version.
+    upstream_model = model if auth == "passthrough" else route["model"]
     is_streaming = bool(body_json.get("stream"))
     backend_label = {"none": "LOCAL", "aws": "BEDROCK"}.get(auth, "PASSTHROUGH")
     price_per_mtok: float = float(route.get("price_per_mtok", 0))
     tier: str = route.get("tier", "")
+    tokenizer_model: str | None = route.get("tokenizer_model")
 
     # Neither OpenAI endpoints nor vllm-mlx (Qwen3VL) handle /count_tokens reliably;
-    # return a rough estimate so Claude Code doesn't block on a 500.
-    if req_suffix == "/count_tokens" and (
-        api_type == "openai" or auth == "none"
-    ):
-        from fastapi.responses import JSONResponse
-
+    # return an estimate (exact, if a tokenizer is configured) so Claude Code doesn't
+    # block on a 500.
+    if req_suffix == "/count_tokens" and (api_type == "openai" or auth == "none"):
+        if api_type == "openai" and tokenizer_model:
+            oai_body_for_count = _anthropic_to_openai_request(body_json)
+            token_count = count_oai_request_tokens(oai_body_for_count, tokenizer_model)
+            if token_count is not None:
+                return JSONResponse({"input_tokens": token_count})
         return JSONResponse({"input_tokens": len(json.dumps(body_json)) // 4})
 
     # For Anthropic routes the URL has the suffix appended (supports /count_tokens).
@@ -1101,97 +334,113 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     # ceiling: never let max_tokens in the forwarded request exceed what the upstream accepts.
     # When absent from the route config, leave the request unchanged.
     route_max_tokens: int | None = route.get("max_tokens")
-
-    # Dynamic context window enforcement — calculate remaining tokens based on input size.
-    # This prevents context overflow by capping output tokens when the input is large.
-    route_context_window: int | None = route.get("context_window")
-    if route_context_window is not None and auth != "none":
-        # Estimate input tokens. The char-based heuristic (4 chars ≈ 1 token) undercounts
-        # because it misses structural tokens added by the model's chat template: role
-        # delimiters, tool-call markers, BOS/EOS tokens, and JSON punctuation that tokenizes
-        # at higher density than prose. Apply a 20% safety multiplier so the cap fires before
-        # Bedrock rejects the request for exceeding the context window.
-        estimated_input_tokens = int(_estimate_input_tokens(body_json) * 1.20)
-        remaining_tokens = route_context_window - estimated_input_tokens
-        requested_max = body_json.get("max_tokens", 0)
-        log.info(
-            "[model-router] context window: estimated_input=%d remaining=%d requested=%d",
-            estimated_input_tokens, remaining_tokens, requested_max,
-        )
-        if remaining_tokens <= 0:
-            # The 1.20x safety multiplier pushed the estimate over the context window.
-            # Recover the raw (pre-multiplier) estimate and use 70% of its remaining
-            # capacity as max_tokens — much closer to the real working value than
-            # the route ceiling (65536), so the Bedrock retry loop needs fewer halvings.
-            raw_estimate = int(estimated_input_tokens / 1.20)
-            raw_remaining = route_context_window - raw_estimate
-            log.warning(
-                "[model-router] 1.20x estimate (%d) >= context_window (%d); "
-                "raw_estimate=%d raw_remaining=%d",
-                estimated_input_tokens, route_context_window, raw_estimate, raw_remaining,
-            )
-            if raw_remaining > 0:
-                smart_max = max(1024, int(raw_remaining * 0.70))
-                if route_max_tokens is not None:
-                    smart_max = min(smart_max, route_max_tokens)
-                if requested_max > smart_max:
-                    body_json["max_tokens"] = smart_max
-                    body_changed = True
-                    log.warning(
-                        "[model-router] overflow: seeding max_tokens=%d "
-                        "(raw_remaining=%d × 70%%)",
-                        smart_max, raw_remaining,
-                    )
-            # If raw_remaining <= 0 the input is genuinely too large for any output;
-            # let the route_max_tokens ceiling apply and the Bedrock response will be
-            # an irrecoverable overflow error surfaced directly to Claude Code.
-        else:
-            if route_max_tokens is not None:
-                effective_max_tokens = min(route_max_tokens, remaining_tokens)
-            else:
-                effective_max_tokens = remaining_tokens
-            if requested_max > effective_max_tokens:
-                body_json["max_tokens"] = effective_max_tokens
-                body_changed = True
-                log.info(
-                    "[model-router] dynamic max_tokens: capped %d → %d",
-                    requested_max, effective_max_tokens,
-                )
-
     tool_name_map: dict[str, str] = {}
 
-    # Tool name sanitization is vllm-mlx specific (local routes only).
-    if auth == "none":
-        body_json, tool_name_map = _sanitize_tools(body_json)
-        if tool_name_map:
-            body_changed = True
-            log.info(
-                "[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map)
-            )
-
-    # route_max_tokens is the model's hard output limit — enforce as a ceiling for all
-    # route types. Never raise max_tokens here: for remote routes the dynamic context
-    # window cap above may have already reduced it below route_max_tokens to fit within
-    # the remaining context, and raising it back would undo that work.
-    if route_max_tokens is not None:
-        if body_json.get("max_tokens", 0) > route_max_tokens:
-            body_json["max_tokens"] = route_max_tokens
-            body_changed = True
-
-    # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
-    # to disable the reasoning chain that would otherwise appear as visible output).
-    route_chat_template_kwargs: dict | None = route.get("chat_template_kwargs")
-    if route_chat_template_kwargs and api_type != "openai":
-        merged = {**route_chat_template_kwargs, **body_json.get("chat_template_kwargs", {})}
-        body_json["chat_template_kwargs"] = merged
-        body_changed = True
-
-    if api_type == "openai":
-        # Translate Anthropic → OpenAI; re-encode immediately.
+    # ── Context enforcement ───────────────────────────────────────────────────
+    #
+    # Two strategies, mutually exclusive:
+    #
+    # A. Tokenizer-based (preferred): translate to OpenAI format first, count tokens
+    #    with the real HF tokenizer + chat template, then compress/drop messages if
+    #    over budget. Activated when the route has a `tokenizer_model` field
+    #    (Bedrock/Qwen routes only).
+    #
+    # B. Character-based (fallback): 4-chars-per-token heuristic with a 1.20x safety
+    #    multiplier. Used for local routes, Anthropic-format Bedrock/passthrough
+    #    routes, and any OpenAI-format route without a `tokenizer_model` configured.
+    #
+    if tokenizer_model and api_type == "openai":
         body_json = _anthropic_to_openai_request(body_json)
+        body_json = enforce_context_budget(body_json, route, tokenizer_model)
         raw_body = json.dumps(body_json).encode()
-    elif body_changed:
-        raw_body = json.dumps(body_json).encode()
+    else:
+        # Dynamic context window enforcement — calculate remaining tokens based on input size.
+        # This prevents context overflow by capping output tokens when the input is large.
+        route_context_window: int | None = route.get("context_window")
+        if route_context_window is not None and auth != "none":
+            # Estimate input tokens. The char-based heuristic (4 chars ≈ 1 token) undercounts
+            # because it misses structural tokens added by the model's chat template: role
+            # delimiters, tool-call markers, BOS/EOS tokens, and JSON punctuation that tokenizes
+            # at higher density than prose. Apply a 20% safety multiplier so the cap fires before
+            # Bedrock rejects the request for exceeding the context window.
+            estimated_input_tokens = int(_estimate_input_tokens(body_json) * 1.20)
+            remaining_tokens = route_context_window - estimated_input_tokens
+            requested_max = body_json.get("max_tokens", 0)
+            log.info(
+                "[model-router] context window: estimated_input=%d remaining=%d requested=%d",
+                estimated_input_tokens, remaining_tokens, requested_max,
+            )
+            if remaining_tokens <= 0:
+                # The 1.20x safety multiplier pushed the estimate over the context window.
+                # Recover the raw (pre-multiplier) estimate and use 70% of its remaining
+                # capacity as max_tokens — much closer to the real working value than
+                # the route ceiling (65536), so the Bedrock retry loop needs fewer halvings.
+                raw_estimate = int(estimated_input_tokens / 1.20)
+                raw_remaining = route_context_window - raw_estimate
+                log.warning(
+                    "[model-router] 1.20x estimate (%d) >= context_window (%d); "
+                    "raw_estimate=%d raw_remaining=%d",
+                    estimated_input_tokens, route_context_window, raw_estimate, raw_remaining,
+                )
+                if raw_remaining > 0:
+                    smart_max = max(1024, int(raw_remaining * 0.70) - _TOKEN_ESTIMATE_SAFETY_BUFFER)
+                    if route_max_tokens is not None:
+                        smart_max = min(smart_max, route_max_tokens)
+                    if requested_max > smart_max:
+                        body_json["max_tokens"] = smart_max
+                        body_changed = True
+                        log.warning(
+                            "[model-router] overflow: seeding max_tokens=%d "
+                            "(raw_remaining=%d × 70%% − buffer)",
+                            smart_max, raw_remaining,
+                        )
+                # If raw_remaining <= 0 the input is genuinely too large for any output;
+                # let the route_max_tokens ceiling apply and the Bedrock response will be
+                # an irrecoverable overflow error surfaced directly to Claude Code.
+            else:
+                if route_max_tokens is not None:
+                    effective_max_tokens = min(route_max_tokens, remaining_tokens)
+                else:
+                    effective_max_tokens = remaining_tokens
+                effective_max_tokens = max(1, effective_max_tokens - _TOKEN_ESTIMATE_SAFETY_BUFFER)
+                if requested_max > effective_max_tokens:
+                    body_json["max_tokens"] = effective_max_tokens
+                    body_changed = True
+                    log.info(
+                        "[model-router] dynamic max_tokens: capped %d → %d",
+                        requested_max, effective_max_tokens,
+                    )
+
+        # Tool name sanitization is vllm-mlx specific (local routes only).
+        if auth == "none":
+            body_json, tool_name_map = _sanitize_tools(body_json)
+            if tool_name_map:
+                body_changed = True
+                log.info("[model-router] sanitized %d tool name(s) for vllm-mlx", len(tool_name_map))
+
+        # route_max_tokens is the model's hard output limit — enforce as a ceiling for all
+        # route types. Never raise max_tokens here: for remote routes the dynamic context
+        # window cap above may have already reduced it below route_max_tokens to fit within
+        # the remaining context, and raising it back would undo that work.
+        if route_max_tokens is not None:
+            if body_json.get("max_tokens", 0) > route_max_tokens:
+                body_json["max_tokens"] = route_max_tokens
+                body_changed = True
+
+        # Inject chat_template_kwargs from route config (e.g. {"enable_thinking": false} for Qwen3
+        # to disable the reasoning chain that would otherwise appear as visible output).
+        route_chat_template_kwargs: dict | None = route.get("chat_template_kwargs")
+        if route_chat_template_kwargs and api_type != "openai":
+            merged = {**route_chat_template_kwargs, **body_json.get("chat_template_kwargs", {})}
+            body_json["chat_template_kwargs"] = merged
+            body_changed = True
+
+        if api_type == "openai":
+            # Translate Anthropic → OpenAI; re-encode immediately.
+            body_json = _anthropic_to_openai_request(body_json)
+            raw_body = json.dumps(body_json).encode()
+        elif body_changed:
+            raw_body = json.dumps(body_json).encode()
 
     # ── Build upstream headers ────────────────────────────────────────────────
     base_headers = _passthrough_headers(request)
@@ -1199,9 +448,7 @@ async def proxy_messages(request: Request) -> StreamingResponse:
 
     # Strip Anthropic-specific headers before forwarding to OpenAI-format endpoints.
     if api_type == "openai":
-        base_headers = {
-            k: v for k, v in base_headers.items() if k.lower() not in _ANTHROPIC_ONLY_HEADERS
-        }
+        base_headers = {k: v for k, v in base_headers.items() if k.lower() not in _ANTHROPIC_ONLY_HEADERS}
 
     if auth == "none":
         upstream_headers = base_headers
@@ -1243,7 +490,6 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     # ── OpenAI route: use openai SDK (typed chunks, SigV4 via httpx.Auth) ─────
     if api_type == "openai":
         import openai
-        from fastapi.responses import JSONResponse, Response
 
         # Strip /chat/completions suffix to get the base URL the SDK appends to.
         base_url = target_url.removesuffix("/chat/completions")
@@ -1265,13 +511,16 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         try:
             if is_streaming:
                 # Peek at the first chunk before committing to StreamingResponse so we can
-                # detect context-overflow 400s (Bedrock sends HTTP 200 + error event in stream).
-                # Bedrock's error reports "input = context_window + 1 - max_tokens" (a formula,
-                # not the true count), so we can't compute the exact fix — instead we halve
-                # max_tokens on each attempt until it succeeds or we exhaust retries.
+                # detect context-overflow 400s (Bedrock sends HTTP 200 + error event in
+                # stream). This is a last-resort safety net: Strategy A's preflight
+                # compression already avoids most overflows for tokenizer-configured
+                # routes, but Strategy B routes (and any tokenizer under-estimate) still
+                # need it. Bedrock's error reports "input = context_window + 1 - max_tokens"
+                # (a formula, not the true count), so we can't compute the exact fix —
+                # halve max_tokens on each attempt until it succeeds or retries exhaust.
                 _MAX_OVERFLOW_RETRIES = 4
                 first_chunk = None
-                _original_max = oai_kwargs.get("max_tokens", route_context_window or 32768)
+                _original_max = oai_kwargs.get("max_tokens", route.get("context_window") or 32768)
                 _overflow_attempt = 0
                 _throttle_attempt = 0
                 while True:
@@ -1289,7 +538,11 @@ async def proxy_messages(request: Request) -> StreamingResponse:
                         break  # success — proceed with this stream
                     except Exception as peek_exc:
                         if stream is not None:
-                            await stream.close()
+                            # Handle both sync close() and async aclose()/close() — don't assume the
+                            # openai SDK's stream.close() is always a coroutine.
+                            _close_result = stream.close()
+                            if inspect.isawaitable(_close_result):
+                                await _close_result
                         _status = getattr(peek_exc, "status_code", None)
                         # Prefer raw response body for regex matching (more reliable than str(exc))
                         _resp = getattr(peek_exc, "response", None)
@@ -1389,7 +642,7 @@ async def proxy_messages(request: Request) -> StreamingResponse:
     client = httpx.AsyncClient(timeout=None)
     try:
         upstream_resp = await _send_with_bedrock_retry(
-            client, target_url, upstream_headers, raw_body, route, auth
+            client, target_url, upstream_headers, raw_body, route, auth, request_id
         )
     except Exception:
         await client.aclose()
@@ -1400,13 +653,14 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         error_body = await upstream_resp.aread()
         await client.aclose()
         log.error(
-            "[model-router] upstream %d from %s: %s",
+            "[model-router] request_id=%s upstream %d from %s: %s",
+            request_id,
             upstream_resp.status_code,
             target_url,
             error_body[:1000].decode("utf-8", errors="replace"),
         )
-        from fastapi.responses import Response
-
+        if is_fallback_route:
+            error_body = _annotate_fallback_error(error_body, model)
         return Response(
             content=error_body,
             status_code=upstream_resp.status_code,
@@ -1414,7 +668,6 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         )
 
     # ── Anthropic route: strip hop-by-hop headers and stream verbatim ─────────
-    _HOP_BY_HOP = frozenset({"content-encoding", "transfer-encoding", "connection", "keep-alive"})
     resp_headers = {
         k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_BY_HOP
     }
@@ -1426,83 +679,6 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
     )
 
-
-async def _oai_stream_with_cleanup(
-    stream,
-    msg_id: str,
-    upstream_model: str,
-    backend_label: str,
-    http_client: httpx.AsyncClient,
-    price_per_mtok: float = 0.0,
-    tier: str = "",
-    first_chunk=None,
-) -> AsyncGenerator[bytes, None]:
-    """Wrap _stream_oai_sdk_to_anthropic and close the httpx client when the stream ends."""
-    try:
-        async for chunk in _stream_oai_sdk_to_anthropic(stream, msg_id, upstream_model, backend_label, price_per_mtok, tier, first_chunk=first_chunk):
-            yield chunk
-    finally:
-        await http_client.aclose()
-
-
-async def _stream_logging(
-    resp: httpx.Response,
-    client: httpx.AsyncClient,
-    tool_name_map: dict[str, str],
-    backend_label: str,
-    upstream_model: str,
-    is_streaming: bool,
-    price_per_mtok: float = 0.0,
-    tier: str = "",
-) -> AsyncGenerator[bytes, None]:
-    """Stream bytes, restore tool names, and log token usage at completion."""
-    input_tokens = 0
-    output_tokens = 0
-    partial_sse = ""
-    body_bytes = b""
-
-    try:
-        async for chunk in resp.aiter_bytes():
-            text: str | None = None
-            if tool_name_map:
-                text = chunk.decode("utf-8", errors="replace")
-                for sanitized, original in tool_name_map.items():
-                    text = text.replace(f'"name":"{sanitized}"', f'"name":"{original}"')
-                    text = text.replace(f'"name": "{sanitized}"', f'"name": "{original}"')
-                chunk = text.encode("utf-8")
-
-            if is_streaming:
-                partial_sse += text if text is not None else chunk.decode("utf-8", errors="replace")
-                while "\n\n" in partial_sse:
-                    event_text, partial_sse = partial_sse.split("\n\n", 1)
-                    for line in event_text.split("\n"):
-                        if line.startswith("data: "):
-                            try:
-                                ev = json.loads(line[6:])
-                                etype = ev.get("type")
-                                if etype == "message_start":
-                                    usage = ev.get("message", {}).get("usage", {})
-                                    input_tokens = usage.get("input_tokens", input_tokens)
-                                elif etype == "message_delta":
-                                    usage = ev.get("usage", {})
-                                    output_tokens = usage.get("output_tokens", output_tokens)
-                            except (json.JSONDecodeError, KeyError):
-                                pass
-            else:
-                body_bytes += chunk
-
-            yield chunk
-    finally:
-        if not is_streaming:
-            try:
-                usage = json.loads(body_bytes).get("usage", {})
-                input_tokens = usage.get("input_tokens", 0)
-                output_tokens = usage.get("output_tokens", 0)
-            except (json.JSONDecodeError, AttributeError):
-                pass
-        _record_tokens(upstream_model, input_tokens, output_tokens, price_per_mtok, backend_label, tier)
-        await resp.aclose()
-        await client.aclose()
 
 
 # ---------------------------------------------------------------------------
