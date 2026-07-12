@@ -20,6 +20,7 @@ _OPUS_PRICE_PER_MTOK: float = next(
     5.0,
 )
 
+
 # Per-model cumulative token counters {upstream_model: {"input": int, "output": int, "price_per_mtok": float}}
 _token_stats: dict[str, dict] = {}
 
@@ -29,7 +30,12 @@ _TIER_ORDER = ["low", "med", "high", "top"]
 
 
 def _record_tokens(upstream_model: str, in_tok: int, out_tok: int, price_per_mtok: float, backend_label: str, tier: str = "") -> None:
-    """Update cumulative stats and emit a compact status line."""
+    """Update cumulative stats and emit a compact status line.
+
+    Detailed per-model breakdown goes to the log file (stderr).
+    A one-line tier summary overwrites the current terminal line on stdout —
+    this is the "savings ticker" visible while Claude Code is running.
+    """
     log.info(
         "[model-router] tokens  in=%-6d out=%-6d backend=%-12s model=%s",
         in_tok, out_tok, backend_label, upstream_model,
