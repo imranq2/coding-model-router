@@ -98,7 +98,6 @@ suppression mechanisms, one for each code path:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -111,6 +110,21 @@ from typing import AsyncGenerator
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+
+from aws_auth import _SigV4Auth, _sign_bedrock
+from constants import (
+    _ANTHROPIC_ONLY_HEADERS,
+    _BEDROCK_MIN_DISPATCH_INTERVAL_S,
+    _CONTEXT_OVERFLOW_RE,
+    _HOP_BY_HOP,
+    _MAX_THROTTLE_RETRIES,
+    _OAI_TO_ANT_STOP,
+    _SKIP_HEADERS,
+    _THROTTLE_BASE_DELAY_S,
+    _THROTTLE_MAX_DELAY_S,
+    _THROTTLE_TEXT_RE,
+)
+from tool_sanitizer import _sanitize_tools
 
 # Logs go to stderr — start-model-router.sh redirects stderr to the log file.
 # stdout is reserved for the live status line only.
@@ -169,109 +183,6 @@ _OPUS_PRICE_PER_MTOK: float = next(
 
 
 # ---------------------------------------------------------------------------
-# Tool name sanitization for local (vllm-mlx) routes
-# ---------------------------------------------------------------------------
-
-_VALID_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
-def _sanitize_tool_name(name: str) -> str:
-    """Map an arbitrary tool name to one that satisfies ^[A-Za-z0-9_-]{1,64}$."""
-    sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", name)
-    if len(sanitized) <= 64:
-        return sanitized
-    # Stable 64-char form: first 55 chars + '_' + 8-char SHA-256 prefix
-    h = hashlib.sha256(name.encode()).hexdigest()[:8]
-    return sanitized[:55] + "_" + h
-
-
-def _sanitize_tools(body_json: dict) -> tuple[dict, dict]:
-    """Sanitize tool names for vllm-mlx's [A-Za-z0-9_-]{1,64} constraint.
-
-    Returns (modified_body_json, {sanitized_name: original_name}).
-    Only entries that needed sanitization appear in the map.
-    """
-    tools = body_json.get("tools")
-    if not tools:
-        return body_json, {}
-
-    mapping: dict[str, str] = {}
-    new_tools: list = []
-    used: set[str] = set()
-
-    for tool in tools:
-        original_name = tool.get("name", "")
-        if _VALID_TOOL_NAME_RE.match(original_name):
-            new_tools.append(tool)
-            used.add(original_name)
-        else:
-            sanitized = _sanitize_tool_name(original_name)
-            base, i = sanitized, 1
-            while sanitized in used:
-                suffix = f"_{i}"
-                sanitized = base[: 64 - len(suffix)] + suffix
-                i += 1
-            used.add(sanitized)
-            mapping[sanitized] = original_name
-            new_tools.append({**tool, "name": sanitized})
-
-    if not mapping:
-        return body_json, {}
-    return {**body_json, "tools": new_tools}, mapping
-
-
-# ---------------------------------------------------------------------------
-# SigV4 signing for Bedrock Mantle
-# ---------------------------------------------------------------------------
-
-
-def _sign_bedrock(url: str, body: bytes, route: dict) -> dict:
-    """Return a headers dict with AWS SigV4 Authorization for a Bedrock POST."""
-    import boto3
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-
-    # Profile comes from AWS_PROFILE env var (set in the user's shell before starting the router).
-    # Not stored in router_config.json so the config is shareable without exposing profile names.
-    profile = os.environ.get("AWS_PROFILE")
-    region = route.get("aws_region", "us-east-1")
-
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    creds = session.get_credentials().get_frozen_credentials()
-    req = AWSRequest(
-        method="POST",
-        url=url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    SigV4Auth(creds, "bedrock", region).add_auth(req)
-    return dict(req.headers)
-
-
-# ---------------------------------------------------------------------------
-# SigV4 httpx.Auth — applied per-request by the openai SDK's underlying transport
-# ---------------------------------------------------------------------------
-
-
-class _SigV4Auth(httpx.Auth):
-    """Apply AWS SigV4 signing to every request the openai SDK makes.
-
-    httpx calls auth_flow synchronously before each send. At that point the
-    openai SDK has already serialised the body to bytes, so request.content is
-    available for body-hash computation.
-    """
-
-    def __init__(self, route: dict) -> None:
-        self._route = route
-
-    def auth_flow(self, request: httpx.Request):
-        signed = _sign_bedrock(str(request.url), request.content, self._route)
-        for k, v in signed.items():
-            request.headers[k.lower()] = v
-        yield request
-
-
-# ---------------------------------------------------------------------------
 # Retry/backoff for Bedrock throttling
 # ---------------------------------------------------------------------------
 #
@@ -290,7 +201,6 @@ class _SigV4Auth(httpx.Auth):
 # Enforcing a minimum gap between consecutive dispatches smooths these bursts
 # without blocking concurrent in-flight streams (lock released immediately
 # after the timestamp update, before the actual HTTP send).
-_BEDROCK_MIN_DISPATCH_INTERVAL_S = 0.3  # ≤ ~3 new Bedrock dispatches/sec
 _bedrock_dispatch_lock = asyncio.Lock()
 _bedrock_last_dispatch: float = 0.0  # asyncio monotonic time of last dispatch
 
@@ -303,24 +213,6 @@ async def _pace_bedrock_dispatch() -> None:
         if wait > 0:
             await asyncio.sleep(wait)
         _bedrock_last_dispatch = asyncio.get_running_loop().time()
-
-
-_MAX_THROTTLE_RETRIES = 5
-_THROTTLE_BASE_DELAY_S = 1.0
-_THROTTLE_MAX_DELAY_S = 20.0
-
-_THROTTLE_TEXT_RE = re.compile(
-    r"throttl|too many requests|rate.?limit|try again later"
-    r"|increase.*traffic|traffic.*increase"
-    r"|on.?demand.capacity|exceed.*capacity|double faster",
-    re.IGNORECASE,
-)
-
-# Matches Bedrock's context-window overflow error. Defined at module level so
-# _is_throttling_status can explicitly exclude it — context overflow is a
-# deterministic failure (input too large) that requires modifying the request,
-# not a transient server-side error that resolves on retry.
-_CONTEXT_OVERFLOW_RE = re.compile(r"contains at least (\d+) input tokens", re.IGNORECASE)
 
 
 def _throttle_backoff_seconds(attempt: int) -> float:
@@ -399,9 +291,6 @@ async def _send_with_bedrock_retry(
 # OpenAI <-> Anthropic translation (for api_type: "openai" routes)
 # ---------------------------------------------------------------------------
 
-# finish_reason/stop_reason mappings
-_OAI_TO_ANT_STOP = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
-
 
 class _ThinkingStripper:
     """Strip <think>…</think> blocks from streamed output on Bedrock OpenAI routes.
@@ -476,10 +365,6 @@ class _ThinkingStripper:
             if self._buf.endswith(tag[:i]):
                 return len(self._buf) - i
         return len(self._buf)
-
-
-# Headers that are Anthropic-specific and must not be forwarded to OpenAI endpoints
-_ANTHROPIC_ONLY_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "x-api-key"})
 
 
 def _msg_id() -> str:
@@ -1011,8 +896,6 @@ async def _stream_oai_sdk_to_anthropic(
 
 app = FastAPI(title="model-router", docs_url=None, redoc_url=None)
 
-_SKIP_HEADERS = frozenset({"host", "content-length", "transfer-encoding", "authorization"})
-
 
 def _passthrough_headers(request: Request) -> dict:
     """All client headers except ones we rebuild ourselves."""
@@ -1414,7 +1297,6 @@ async def proxy_messages(request: Request) -> StreamingResponse:
         )
 
     # ── Anthropic route: strip hop-by-hop headers and stream verbatim ─────────
-    _HOP_BY_HOP = frozenset({"content-encoding", "transfer-encoding", "connection", "keep-alive"})
     resp_headers = {
         k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_BY_HOP
     }
